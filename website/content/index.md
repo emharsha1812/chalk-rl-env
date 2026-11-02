@@ -117,7 +117,7 @@ hide:
     <dl>
       <div><dt>WORK</dt><dd>Complete a Lean proof</dd></div>
       <div><dt>CHECK</dt><dd>Upstream Comparator</dd></div>
-      <div><dt>REWARD</dt><dd>1 if the proof passes; otherwise 0</dd></div>
+      <div><dt>REWARD</dt><dd>1 if accepted; 0 if rejected</dd></div>
     </dl>
     <p>One task is available in the <code>lean-math</code> template.</p>
   </div>
