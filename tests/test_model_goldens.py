@@ -1,0 +1,573 @@
+"""Golden locks on every model-conditional code path in chalk.
+
+Each golden covers one seam across the same model list: chalk's catalog plus
+extra ids that reach branches no catalogued model does.
+
+Regenerate after an intentional change with:
+
+    UPDATE_GOLDEN=1 pytest tests/test_model_goldens.py
+
+and review the golden diff carefully.
+"""
+
+from collections.abc import Callable
+from dataclasses import asdict
+from typing import Any, final, override
+
+import litellm
+import pytest
+from litellm import CustomStreamWrapper
+from litellm.types.utils import (
+    ChatCompletionDeltaToolCall,
+    ModelResponseStream,
+    StreamingChoices,
+    Usage,
+)
+from litellm.types.utils import Delta as LiteLlmDelta
+from litellm.types.utils import Function as LiteLlmFunction
+from litellm.utils import get_optional_params
+
+from chalk.agents.builtin_source import IMAGE_OMITTED_TEXT, BuiltinSource
+from chalk.agents.models import resolve_model
+from chalk.judges.rubric_judge import RubricJudge
+from chalk.model_catalog import CATALOG_MODEL_IDS
+from chalk.model_spec import ReasoningEffort, spec_for
+from chalk.schemas.chat import Message
+from chalk.schemas.evaluation_run_config import EvaluationRunConfig
+from chalk.schemas.transcript import MessageAddedEvent
+
+type Golden = Callable[[str, Any], None]
+
+# Ids that reach a chalk branch the catalog doesn't cover.
+_EXTRA_MODELS = (
+    "anthropic/claude-opus-5",
+    "openai/gpt-5.3-codex",
+    "openai/gpt-5.6-2026-04-01",
+    "fireworks_ai/accounts/fireworks/models/kimi-k2p5",
+    "mistral/mistral-medium-3.5",
+    "gemini/gemini-3-pro",
+    "vertex_ai/claude-opus-4-6",
+    "pt/some-training-checkpoint",
+    "some-unknown-model",
+)
+
+MODELS = CATALOG_MODEL_IDS + _EXTRA_MODELS
+
+
+def _config(model: str, **overrides: Any) -> EvaluationRunConfig:
+    return EvaluationRunConfig(
+        run_id="golden-run",
+        task_id="golden-task",
+        model=model,
+        model_api_key="test_key",
+        **overrides,
+    )
+
+
+def _completion_params(model: str) -> dict[str, Any]:
+    """Request params for a one-message, no-tool turn.
+
+    Tool serialization is model-independent and already pinned by
+    ``llm_completion_params.json``; leaving it out keeps the diff readable.
+    """
+    source = BuiltinSource(_config(model))
+    return source.get_completion_params([Message(role="user", content="Go.")], [])
+
+
+def test_golden_completion_params_by_model(
+    monkeypatch: pytest.MonkeyPatch, assert_matches_golden: Golden
+):
+    """Model routing, max_tokens, reasoning effort, thinking display, provider
+    request bodies, and prompt-caching placement, for every model."""
+    monkeypatch.delenv("CHALK_PROXY_URL", raising=False)
+
+    assert_matches_golden(
+        "completion_params_by_model.json",
+        {model: _completion_params(model) for model in MODELS},
+    )
+
+
+def test_golden_completion_params_by_model_with_proxy(
+    monkeypatch: pytest.MonkeyPatch, assert_matches_golden: Golden
+):
+    """Which models get routed through CHALK_PROXY_URL."""
+    monkeypatch.setenv("CHALK_PROXY_URL", "https://proxy.example/")
+
+    assert_matches_golden(
+        "completion_params_by_model_with_proxy.json",
+        {model: _completion_params(model) for model in MODELS},
+    )
+
+
+_LITELLM_REASONING_KEYS = (
+    "reasoning_effort",
+    "thinking",
+    "output_config",
+    "thinkingConfig",
+)
+
+_REASONING_KEYS = ("reasoning_effort", "thinking")
+
+
+def _litellm_reasoning_params(model: str, level: ReasoningEffort | None) -> Any:
+    """What litellm makes of the effort chalk sends, or the error it raises.
+
+    chalk leaves ``litellm.drop_params`` off, so a level a model does not
+    accept aborts the run rather than being quietly dropped.
+    """
+    source = BuiltinSource(_config(model, reasoning_effort=level))
+    params = source.get_completion_params([Message(role="user", content="Go.")], [])
+    try:
+        name, provider, _, _ = litellm.get_llm_provider(model=params["model"])
+        mapped = get_optional_params(
+            model=name,
+            custom_llm_provider=provider,
+            max_tokens=params["max_tokens"],
+            allowed_openai_params=params["allowed_openai_params"],
+            **{k: v for k, v in params.items() if k in _REASONING_KEYS},
+        )
+    except Exception as e:  # noqa: BLE001
+        return f"{type(e).__name__}: {e}"
+    return {k: v for k, v in mapped.items() if k in _LITELLM_REASONING_KEYS}
+
+
+def test_golden_reasoning_effort_by_model(
+    monkeypatch: pytest.MonkeyPatch, assert_matches_golden: Golden
+):
+    """Per model and effort setting: what chalk asks for, and what litellm
+    turns it into on the wire."""
+    monkeypatch.delenv("CHALK_PROXY_URL", raising=False)
+
+    assert_matches_golden(
+        "reasoning_effort_by_model.json",
+        {
+            model: {
+                str(level): {
+                    "sent_by_chalk": BuiltinSource(
+                        _config(model, reasoning_effort=level)
+                    )
+                    .get_completion_params([Message(role="user", content="Go.")], [])
+                    .get("reasoning_effort"),
+                    "mapped_by_litellm": _litellm_reasoning_params(model, level),
+                }
+                for level in (None, "min", "max")
+            }
+            for model in MODELS
+        },
+    )
+
+
+def test_gemini_gets_thought_summaries_without_an_effort_level():
+    """Without an effort level litellm sends no thinking config, so chalk asks
+    for thought summaries itself; with one, litellm asking too is a conflict."""
+    params = _completion_params("vertex_ai/gemini-3.7-flash")
+    assert params["thinkingConfig"] == {"includeThoughts": True}
+
+    source = BuiltinSource(
+        _config("vertex_ai/gemini-3.7-flash", reasoning_effort="max")
+    )
+    with_effort = source.get_completion_params(
+        [Message(role="user", content="Go.")], []
+    )
+    assert "thinkingConfig" not in with_effort
+
+    assert "thinkingConfig" not in _completion_params("claude-fable-5")
+
+
+def test_gemini_3_8_flash_effort_gets_past_litellms_cost_map_check():
+    """litellm validates reasoning_effort on Gemini against its cost map, which
+    predates 3.8 Flash, so without an explicit allowed_openai_params entry the
+    effort would abort the run. Allowed through, litellm still maps it onto
+    thinkingLevel exactly as it does for 3.7."""
+    for model in ("vertex_ai/gemini-3.8-flash", "vertex_ai/gemini-3.7-flash"):
+        mapped = _litellm_reasoning_params(model, "max")
+        assert mapped["thinkingConfig"] == {
+            "thinkingLevel": "high",
+            "includeThoughts": True,
+        }, model
+        assert _litellm_reasoning_params(model, "min")["thinkingConfig"] == {
+            "thinkingLevel": "low",
+            "includeThoughts": True,
+        }, model
+
+
+def test_grok_effort_gets_past_litellms_cost_map_check():
+    """litellm 1.94 raises UnsupportedParamsError for reasoning_effort on any xai
+    id outside its cost map, which has no responses/<model> name for any Grok."""
+    for model in ("xai/grok-4.7", "xai/grok-4.6"):
+        for level, effort in (("min", "low"), ("max", "xhigh")):
+            assert _litellm_reasoning_params(model, level) == {
+                "reasoning_effort": effort
+            }, (model, level)
+
+
+def test_muse_spark_asks_for_reasoning_summaries():
+    """Meta hides reasoning on chat completions and only returns summaries on the
+    Responses API, so Muse Spark goes through litellm's Responses bridge."""
+    for model in ("meta/muse-wonder-1.0", "meta/muse-spark-1.3", "meta/muse-spark-1.2"):
+        params = _completion_params(model)
+        assert params["model"] == model.replace("meta/", "meta/responses/")
+        assert params["extra_body"] == {"reasoning_summary": "detailed", "store": False}
+
+
+def test_muse_spark_effort_gets_past_litellms_unknown_model_check():
+    """litellm looks the bridge name responses/<model> up in its cost map and
+    finds nothing, so without an explicit allowed_openai_params entry the
+    effort would abort the run."""
+    for model, top in (
+        ("meta/muse-wonder-1.0", "max"),
+        ("meta/muse-spark-1.3", "max"),
+        ("meta/muse-spark-1.2", "xhigh"),
+    ):
+        assert _litellm_reasoning_params(model, "min") == {
+            "reasoning_effort": "minimal"
+        }
+        assert _litellm_reasoning_params(model, "max") == {"reasoning_effort": top}
+
+
+def test_gpt_6_goes_through_the_responses_bridge():
+    """litellm's built-in OpenAI Responses bridge only matches "gpt-5." names, so
+    GPT-6 is routed there explicitly; Chat Completions would send max_tokens,
+    which OpenAI reasoning models answer 400 to."""
+    for model in (
+        "openai/gpt-6-astra",
+        "openai/gpt-6-sol",
+        "openai/gpt-6-luna",
+        "openai/gpt-6.1-sol",
+    ):
+        params = _completion_params(model)
+        assert params["model"] == model.replace("openai/", "openai/responses/")
+        # Without reasoning_summary litellm builds no reasoning object and
+        # silently drops the effort; the cache key shares extra_body because
+        # litellm drops it as a top-level kwarg. Both confirmed by wire capture.
+        assert params["extra_body"] == {
+            "reasoning_summary": "detailed",
+            "prompt_cache_key": "golden-run",
+            "store": False,
+        }
+        assert "temperature" not in params
+        assert _litellm_reasoning_params(model, "max") == {"reasoning_effort": "max"}
+        assert _litellm_reasoning_params(model, "min") == {"reasoning_effort": "low"}
+
+
+@pytest.mark.parametrize("model", ["together_ai/moonshotai/Kimi-K2.6", "xai/grok-4.7"])
+def test_builtin_sends_the_run_configs_temperature(model: str):
+    source = BuiltinSource(_config(model, temperature=0.3))
+    params = source.get_completion_params([Message(role="user", content="Go.")], [])
+    assert params["temperature"] == 0.3
+
+
+def test_together_effort_gets_past_litellms_param_check():
+    """litellm carries no reasoning_effort in its together_ai param list and
+    raises UnsupportedParamsError rather than forwarding it, so the Together
+    models that take one need an explicit allowed_openai_params entry."""
+    assert _litellm_reasoning_params(
+        "together_ai/deepseek-ai/DeepSeek-V4-Pro-0813", "min"
+    ) == {"reasoning_effort": "high"}
+    assert _litellm_reasoning_params("together_ai/zai-org/GLM-5.3", "max") == {
+        "reasoning_effort": "high"
+    }
+    assert _litellm_reasoning_params("together_ai/Qwen/Qwen3.8-2.4T-A95B", "max") == {
+        "reasoning_effort": "xhigh"
+    }
+    assert _litellm_reasoning_params("together_ai/moonshotai/Kimi-K3", "min") == {
+        "reasoning_effort": "low"
+    }
+    # Models without an effort range send nothing, so there is nothing to allow.
+    assert _litellm_reasoning_params("together_ai/zai-org/GLM-5.2", "max") == {}
+
+
+def test_tools_are_offered_when_the_task_has_them(monkeypatch: pytest.MonkeyPatch):
+    """The no-tool params above would not notice tool_choice regressing."""
+    monkeypatch.delenv("CHALK_PROXY_URL", raising=False)
+    tool: Any = {
+        "type": "function",
+        "function": {"name": "echo", "parameters": {"type": "object"}},
+    }
+    params = BuiltinSource(_config("claude-opus-5")).get_completion_params(
+        [Message(role="user", content="Go.")], [tool]
+    )
+    assert params["tools"] == [tool]
+    assert params["tool_choice"] == "auto"
+
+
+_GLM = "fireworks_ai/accounts/fireworks/models/glm-5p3"
+
+_IMAGE = {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}}
+
+# Verbatim from the providers and litellm; don't tidy them.
+_IMAGES_REJECTED = [
+    "Together_aiException - Invalid multimodal request: multimodal not supported for model: zai-org/GLM-5.2",
+    "Together_aiException - Multimodal processing failed: Multimodal not supported for model: Qwen/Qwen3.8-2.4T-A95B",
+    'Together_aiException - {"error":{"type":"invalid_request_error","code":"multimodal_not_supported","message":"the router has no media spec for this model\'s family and cannot process its media itself; a vLLM worker with --mm-processor inprocess|redis processes it under --mm-processing worker (or auto, when every worker of the model does)","param":null}}',
+    "Fireworks AI model accounts/fireworks/models/glm-5p3 does not support image inputs. Use a Fireworks vision model or remove image_url content blocks.",
+    'Fireworks_aiException - {"error":{"object":"error","type":"invalid_request_error","code":"invalid_request_error","message":"This model does not support image inputs"}}',
+    'Fireworks_aiException - {"error":{"message":"This model does not support image inputs","type":"invalid_request_error","code":400}}',
+]
+
+
+def _messages_with_image() -> list[Message]:
+    return [
+        Message(role="user", content="Go."),
+        Message(role="tool", tool_call_id="call-1", content=[_IMAGE]),
+    ]
+
+
+def _text_chunks(model: str) -> list[ModelResponseStream]:
+    return [
+        ModelResponseStream(
+            model=model,
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=LiteLlmDelta(role="assistant", content="Done."),
+                    finish_reason="stop",
+                )
+            ],
+        )
+    ]
+
+
+def _bad_request(message: str) -> litellm.exceptions.BadRequestError:
+    return litellm.exceptions.BadRequestError(
+        message=message, model=_GLM, llm_provider="x"
+    )
+
+
+def _script_completions(
+    monkeypatch: pytest.MonkeyPatch, *errors: Exception
+) -> list[dict[str, Any]]:
+    """Fails the first calls with ``errors``, then streams a reply; returns the
+    params of every call."""
+    calls: list[dict[str, Any]] = []
+    pending = list(errors)
+
+    async def scripted_acompletion(**kwargs: Any) -> _ScriptedStream:
+        calls.append(kwargs)
+        if pending:
+            raise pending.pop(0)
+        return _ScriptedStream(_text_chunks(kwargs["model"]))
+
+    monkeypatch.setattr("litellm.acompletion", scripted_acompletion)
+    monkeypatch.delenv("CHALK_PROXY_URL", raising=False)
+    return calls
+
+
+async def _turn(source: BuiltinSource, messages: list[Message]) -> None:
+    async for _ in source.collect(messages, []):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", _IMAGES_REJECTED)
+async def test_rejected_images_are_swapped_for_a_note_and_retried(
+    monkeypatch: pytest.MonkeyPatch, error: str
+):
+    calls = _script_completions(monkeypatch, _bad_request(error))
+    messages = _messages_with_image()
+    await _turn(BuiltinSource(_config(_GLM)), messages)
+
+    assert len(calls) == 2
+    assert calls[1]["messages"][1]["content"] == [
+        {"type": "text", "text": IMAGE_OMITTED_TEXT}
+    ]
+    # Only the request changes; the transcript keeps the image.
+    assert messages[1].model_dump()["content"] == [_IMAGE]
+
+
+@pytest.mark.asyncio
+async def test_images_stay_out_for_the_rest_of_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = _script_completions(monkeypatch, _bad_request(_IMAGES_REJECTED[0]))
+    source = BuiltinSource(_config(_GLM))
+    await _turn(source, _messages_with_image())
+    await _turn(source, _messages_with_image())
+
+    assert len(calls) == 3
+    assert calls[2]["messages"][1]["content"][0]["type"] == "text"
+
+
+@pytest.mark.asyncio
+async def test_images_are_sent_until_the_provider_rejects_them(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = _script_completions(monkeypatch)
+    await _turn(BuiltinSource(_config(_GLM)), _messages_with_image())
+
+    assert len(calls) == 1
+    assert calls[0]["messages"][1]["content"] == [_IMAGE]
+
+
+@pytest.mark.asyncio
+async def test_other_bad_requests_still_fail(monkeypatch: pytest.MonkeyPatch):
+    calls = _script_completions(
+        monkeypatch, _bad_request("Unsupported parameter: 'max_tokens'")
+    )
+    with pytest.raises(litellm.exceptions.BadRequestError):
+        await _turn(BuiltinSource(_config(_GLM)), _messages_with_image())
+
+    assert len(calls) == 1
+
+
+# A DeepSeek special token inside a value that is itself JSON-encoded the way
+# xAI double-encodes strings, so both repairs have something to find.
+_DIRTY_ARGUMENTS = '{"text": "\\"<\uff5ctool\u2581call\u2581begin\uff5c>hello\\""}'
+
+
+@final
+class _ScriptedStream(CustomStreamWrapper):
+    """Passes the source's isinstance check while yielding scripted chunks."""
+
+    def __init__(self, chunks: list[ModelResponseStream]):  # pyright: ignore[reportMissingSuperCall]
+        self._chunks = chunks
+
+    @override
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+def _dirty_tool_call_chunks(model: str) -> list[ModelResponseStream]:
+    def chunk(
+        delta: LiteLlmDelta, finish_reason: str | None = None
+    ) -> ModelResponseStream:
+        return ModelResponseStream(
+            id="chatcmpl-golden",
+            created=1735689600,
+            model=model,
+            choices=[
+                StreamingChoices(index=0, delta=delta, finish_reason=finish_reason)
+            ],
+            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+            if finish_reason
+            else None,
+        )
+
+    return [
+        chunk(LiteLlmDelta(role="assistant", content="Calling echo.")),
+        chunk(
+            LiteLlmDelta(
+                tool_calls=[
+                    ChatCompletionDeltaToolCall(
+                        id="call_1",
+                        type="function",
+                        index=0,
+                        function=LiteLlmFunction(
+                            name="echo", arguments=_DIRTY_ARGUMENTS
+                        ),
+                    )
+                ]
+            )
+        ),
+        chunk(LiteLlmDelta(), finish_reason="tool_calls"),
+    ]
+
+
+async def _repaired_arguments(model: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    async def scripted_acompletion(**_kwargs: Any) -> _ScriptedStream:
+        return _ScriptedStream(_dirty_tool_call_chunks(model))
+
+    monkeypatch.setattr("litellm.acompletion", scripted_acompletion)
+
+    source = BuiltinSource(_config(model))
+    added = [
+        event
+        async for event in source.collect([Message(role="user", content="Go.")], [])
+        if isinstance(event, MessageAddedEvent)
+    ]
+    assert len(added) == 1
+    tool_calls = added[0].message.tool_calls
+    assert tool_calls is not None
+    return tool_calls[0].function.arguments
+
+
+@pytest.mark.asyncio
+async def test_golden_tool_call_repair_by_model(
+    monkeypatch: pytest.MonkeyPatch, assert_matches_golden: Golden
+):
+    """Which providers get their tool-call arguments rewritten on the way in
+    (DeepSeek special tokens stripped, xAI's double JSON-encoding undone)."""
+    assert_matches_golden(
+        "tool_call_repair_by_model.json",
+        {
+            "sent_by_the_model": _DIRTY_ARGUMENTS,
+            "seen_by_the_tool": {
+                model: await _repaired_arguments(model, monkeypatch) for model in MODELS
+            },
+        },
+    )
+
+
+def test_golden_cli_agent_model_resolution(assert_matches_golden: Golden):
+    """The provider-native name and credential env var a CLI agent subprocess is
+    handed for each model."""
+    assert_matches_golden(
+        "cli_agent_model_resolution.json",
+        {model: asdict(resolve_model(model, "test_key")) for model in MODELS},
+    )
+
+
+def _rubric_judge_request(model: str, monkeypatch: pytest.MonkeyPatch) -> Any:
+    judge = RubricJudge(
+        rubric=[{"criterion": "is correct", "weight": 1.0}],
+        model=model,
+        api_key="test_key",
+    )
+    captured: dict[str, Any] = {}
+
+    def completion(**kwargs: Any) -> litellm.ModelResponse:
+        captured.update(kwargs)
+        return litellm.ModelResponse(
+            choices=[
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "YES\nthe criterion is met",
+                    }
+                }
+            ]
+        )
+
+    monkeypatch.setattr("litellm.completion", completion)
+
+    is_met, reasoning = judge._evaluate_criterion("some content", "is correct")  # pyright: ignore[reportPrivateUsage]
+    return {
+        "model": captured["model"],
+        "max_tokens": captured["max_tokens"],
+        "temperature": captured.get("temperature", "<omitted>"),
+        "parsed": [is_met, reasoning],
+    }
+
+
+def test_golden_rubric_judge_request_by_model(
+    monkeypatch: pytest.MonkeyPatch, assert_matches_golden: Golden
+):
+    """Which models the rubric judge omits sampling params for."""
+    assert_matches_golden(
+        "rubric_judge_request_by_model.json",
+        {model: _rubric_judge_request(model, monkeypatch) for model in MODELS},
+    )
+
+
+def _api_key_required(model: str) -> bool:
+    return spec_for(model).requires_api_key
+
+
+def test_golden_run_config_model_policy(assert_matches_golden: Golden):
+    """Which agent drives each model, which ones take the training rollout path,
+    and which ones must be given an API key."""
+    assert_matches_golden(
+        "config_policy_by_model.json",
+        {
+            model: {
+                "resolved_agent": _config(model).resolved_agent,
+                "is_special_training_model": _config(model).is_special_training_model,
+                "api_key_required": _api_key_required(model),
+            }
+            for model in MODELS
+        },
+    )

@@ -1,0 +1,23 @@
+{% extends "default/Containerfile" %}
+{% block base_image %}FROM chalk-fineenvs-lean-base:d7056fd{% endblock %}
+{% block extra_env_vars %}
+ENV LEAN_NUM_THREADS=2
+{% endblock %}
+{% block base_system_packages %}
+# The upstream Lean image is Ubuntu, so install Chalk's usual tools with apt.
+RUN apt-get update -qq \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+     ca-certificates curl findutils passwd iptables procps util-linux diffutils \
+     time jq strace tree binutils e2fsprogs tar gzip \
+  # Ubuntu's default user has the same uid Chalk reserves for its student.
+  # Remove its home too, so the new student does not inherit files outside /workdir.
+  && if id ubuntu >/dev/null 2>&1; then userdel --remove ubuntu; fi \
+  && if getent group 1000 >/dev/null; then groupdel "$(getent group 1000 | cut -d: -f1)"; fi \
+  && chmod 0755 /run/lock \
+  && curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh \
+  && chown -R root:root /opt/uv \
+  && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+{% endblock %}
+{% block extra_build_steps %}
+COPY third_party/openai_math/ /usr/share/licenses/chalk-openai-math/
+{% endblock %}

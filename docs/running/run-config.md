@@ -1,0 +1,381 @@
+# Run config
+
+A run config describes how to execute a run: the task, the model, its API key, and options such as limits.
+`chalk run --config` accepts a path to a JSON file or the JSON itself:
+
+```sh
+uv run chalk run --config run_config.json
+```
+
+The JSON gets parsed as an `EvaluationRunConfig`.
+
+## Flags
+
+Without `--config`, `chalk run` builds the config from its flags:
+
+```sh
+uv run chalk run --task find-python --model anthropic/claude-opus-5-5
+```
+
+`--task` and `--model` are then required.
+The run gets a random `run_id`, and `transcript_file` defaults to `out/transcript.json`.
+
+| Flag                 | Field              |
+| -------------------- | ------------------ |
+| `--task`             | `task_id`          |
+| `--agent`            | `agent`            |
+| `--model`            | `model`            |
+| `--model-api-key`    | `model_api_key`    |
+| `--reasoning-effort` | `reasoning_effort` |
+| `--temperature`      | `temperature`      |
+| `--max-output-tokens` | `max_output_tokens` |
+| `--transcript-file`  | `transcript_file`  |
+
+With `--config`, the flags override the config's fields, so one config can be run against several models:
+
+```sh
+uv run chalk run --config run_config.json --model openai/gpt-5.5
+```
+
+The other fields have no flag; set them in a config.
+
+## Create a run config
+
+```sh
+uv run chalk create-run-config --model anthropic/claude-opus-5-5 --task find-python
+```
+
+It loads your tasks, so run it from the environment repo.
+It writes a random `run_id`, sets `transcript_file` to `out/transcript.json`, and fills in every other field with its default:
+
+```json
+{
+    "run_id": "3f9c1a2b",
+    "task_id": "find-python",
+    "model": "anthropic/claude-opus-5-5",
+    "transcript_file": "out/transcript.json",
+    ...
+}
+```
+
+`EvaluationRunConfig` lists every field with its default.
+
+If you rename a task or want to run another one, change `task_id`.
+
+## Extra config
+
+`extra_config` is a free-form dict passed to your task unchanged; see [Tasks and steps](../tasks/tasks-and-steps.md#extra-config) for how a task reads it.
+
+```json
+{
+    "extra_config": {
+        "difficulty": "hard",
+        "extra_system_prompt": "Explain each command before you run it."
+    }
+}
+```
+
+These keys have a built-in meaning:
+
+| Key                          | Value                     | Effect                                                                                                                                                           |
+| ---------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `extra_system_prompt`        | string                    | Appended to the system prompt after a blank line.                                                                                                                |
+| `system_prompt_override`     | string                    | Replaces the system prompt. Wins over `extra_system_prompt`.                                                                                                     |
+| `extra_task_instructions`    | string or list of strings | Appended to the step's instructions after a blank line. A string applies to every step; a list has one entry per step, and steps past its end are unchanged.     |
+| `task_instructions_override` | string or list of strings | Replaces the step's instructions. Same string-or-list rules. Wins over `extra_task_instructions`.                                                                |
+| `extra_artifact_paths`       | string or list of strings | Absolute paths saved as [artifacts](../tasks/artifacts-and-transcripts.md) after each step, before `pre_scoring_hook`. Missing paths are skipped with a warning. |
+
+The first two are read by the `default` template's `get_system_prompt()`, so they only work in tasks that use it.
+Chalk itself applies the latter three.
+
+## Models
+
+`model` is a [litellm](https://docs.litellm.ai/docs/providers) model id with its provider prefix, such as `anthropic/claude-opus-5-5`, `openai/gpt-5` or `together_ai/moonshotai/Kimi-K3`.
+
+`chalk models list` shows the models Chalk knows by name, each with its output-token ceiling and the reasoning effort levels it accepts.
+`--json` prints the catalog as JSON.
+
+```sh
+chalk models list
+```
+
+It also lists prefixes under which any model id is accepted, such as `together_ai/` and `fireworks_ai/`.
+A model Chalk doesn't know still runs, with a 64k output-token ceiling and no reasoning effort parameter.
+
+For the builtin agent, set `--max-output-tokens` to a positive number to override
+the maximum tokens requested for each model response. This is useful when a
+self-hosted server has a smaller context window than Chalk's default. Leave room
+in that window for the prompt and previous messages as well as the response.
+The same setting can be written as `max_output_tokens` in a run config. It is
+recorded in the transcript and cannot be set for other agents.
+
+## API keys
+
+Without `model_api_key`, Chalk reads the key from the model provider's variable in your shell when the run starts:
+
+| Model                       | Variable                                                      |
+| --------------------------- | ------------------------------------------------------------- |
+| `anthropic/...`, `claude-*` | `ANTHROPIC_API_KEY`                                           |
+| `openai/...`                | `OPENAI_API_KEY`                                              |
+| `gemini/...`                | `GEMINI_API_KEY`                                              |
+| `mistral/...`               | `MISTRAL_API_KEY`                                             |
+| `together_ai/...`           | `TOGETHERAI_API_KEY`                                          |
+| `xai/...`                   | `XAI_API_KEY`                                                 |
+| other `<provider>/...`      | `<PROVIDER>_API_KEY`, e.g. `DEEPSEEK_API_KEY`, with a warning |
+
+To use another key, set `model_api_key` to the key itself or to a `$VAR` reference to another variable; `chalk run --model-api-key` and `create-run-config --model-api-key` set it for you.
+If the variable is unset, the run stops with an error, unless it uses the fake model or `--prepare-only`.
+
+### Rubric judge
+
+By default, `RubricJudge` grades with the run's own model and API key.
+To grade with a different model, set `rubric_judge_model`.
+Chalk then reads its key from `rubric_judge_api_key`, or from the provider's variable in the table above.
+If that key is missing, the run still starts.
+
+A model passed to `RubricJudge(model=...)` in the task overrides both.
+
+The fake model and `pt/` models can't grade.
+For those runs, set `rubric_judge_model` or pass a model to `RubricJudge` in the task.
+
+## Reasoning effort
+
+`reasoning_effort` takes:
+
+- `"min"` or `"max"`: the model's lowest or highest level, whatever the provider calls it
+- one of the provider's own level names, such as `"medium"`, if the model accepts it
+- `null`: send nothing and use the provider's default
+
+Providers don't agree on what the levels are called or how many there are, so Chalk automatically selects the right level if you pass `min` or `max`.
+`chalk models list` shows available levels per model.
+
+## Temperature
+
+`temperature` sets the sampling temperature.
+The run config is rejected if it's set for the `external` agent, for a CLI agent that can't send one, or for a model that takes no temperature, such as Claude Opus 5.
+Unset, Chalk sends none and the agent or provider picks.
+
+## Reasoning history
+
+A self-hosted model (`hosted_vllm/...`) is sent the reasoning of its earlier turns, as Claude, OpenAI and xAI models are sent theirs.
+Whether the model sees it is up to its chat template.
+litellm's `hosted_vllm` route removes the reasoning from every assistant message, so the builtin agent calls the same server through litellm's generic OpenAI-compatible route instead.
+The run needs `--proxy` pointing at the server, or litellm's `HOSTED_VLLM_API_BASE`.
+
+The reasoning fills the context window faster.
+When the server refuses a request because the window is full, Chalk leaves out the reasoning of every turn so far, retries, and goes on sending the reasoning of later turns.
+If the request still doesn't fit, the run fails.
+
+## Limits
+
+Use these fields to limit how much work the student can do:
+
+| Field                              | Type                                | Meaning                                                                                                                                                      |
+| ---------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `turn_limit`                       | `int` or `null`                     | Maximum number of model responses in the run. When it's reached, the run ends with an error.                                                                 |
+| `step_time_limit_seconds`          | `float`, list of `float`, or `null` | Maximum wall-clock time per step in seconds, counted from when the step's instructions are sent.                                                             |
+| `on_step_time_limit`               | `"error"` or `"score"`              | What happens when a step runs out of time. `"error"` (the default) ends the run with an error. `"score"` ends the step and scores the student's work so far. |
+| `inject_time_remaining_counter`    | `bool`                              | Tell the student how much time is left. Defaults to `true`.                                                                                                  |
+| `step_context_window_limit`        | `int`, list of `int`, or `null`     | Maximum input tokens per turn in a step, based on what the provider reported for the previous turn.                                                          |
+| `on_step_context_window_limit`     | `"error"` or `"score"`              | Same as `on_step_time_limit`, but for the context limit.                                                                                                     |
+| `inject_context_remaining_counter` | `bool`                              | Tell the student how much context is left. Defaults to `true`.                                                                                               |
+
+The time and context limits apply to each step separately.
+Pass a single value to use it for every step, or a list with one value per step.
+Steps beyond the end of the list have no limit.
+For example, `step_time_limit_seconds: 600` gives the student ten minutes for each step of a two-step task.
+
+Chalk checks both step limits between turns.
+It doesn't interrupt a turn in progress, so a step can go over its limit by up to one turn.
+The context limit uses the input-token count the provider reports for each turn.
+It measures how large the student's context is, not how many tokens were billed over the whole step.
+If the provider doesn't report usage, the context limit never triggers.
+
+When a counter is on, Chalk adds a note like `Time remaining: 540 seconds` or `Context remaining: 12000` to the last tool result of each turn, so the model can pace itself.
+When it's off, the student hits the limit without warning.
+A counter has no effect unless its limit is set.
+
+### Limit support by agent
+
+Agents that run a step in their own process can only enforce the limits their CLI supports.
+
+| Limit                              | `builtin`                          | `external` | CLI agents                                                                                    |
+| ---------------------------------- | ---------------------------------- | ---------- | --------------------------------------------------------------------------------------------- |
+| `turn_limit`                       | Yes                                | Yes        | Per step, through the CLI's `--max-turns`; `codex` and `agy` have none, so Chalk rejects it |
+| `step_time_limit_seconds`          | Yes                                | Yes        | Yes, by killing the CLI's processes                                                           |
+| `inject_time_remaining_counter`    | Yes                                | Yes        | No                                                                                            |
+| `step_context_window_limit`        | Yes, if the provider reports usage | No         | No                                                                                            |
+| `inject_context_remaining_counter` | Yes, if the provider reports usage | No[^ext]   | No                                                                                            |
+
+[^ext]: The external agent doesn't report token usage, so its context counter, if on, always shows the full limit.
+
+## Agents
+
+The agent produces the student's messages and tool calls for each step.
+Don't confuse it with the model: `model` picks which LLM answers, `agent` picks the harness that calls it.
+Whichever agent you use, Chalk still runs the task's hooks, judges and artifacts.
+
+| Agent      | What it does                                                                                                                                                                   |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `builtin`  | The default. Chalk calls the model through litellm, streams its responses, retries failed calls and runs the tool calls.                                                     |
+| `external` | A backend sends each of the model's messages, and Chalk runs the tool calls. Needs `backend_uri`; see [Backend](../extending/backend.md).                                    |
+| CLI agents | A coding agent's own CLI, installed in the image, works on each step as the student and calls the tools itself: `mistral-vibe`, `grok-build`, `claude-code`, `codex` or `agy`. |
+
+Set `agent` in the run config:
+
+```json
+{
+    "agent": "mistral-vibe",
+    "model": "mistral/<model-id>",
+    "model_api_key": "$MISTRAL_API_KEY"
+}
+```
+
+`chalk agents list` shows the agents your Chalk version supports, the version it pins for each CLI agent, and whether that agent is installed.
+`--json` prints the list as JSON, including the model providers each agent works with (`null` means any) and whether it applies the run config's `reasoning_effort` and `temperature`.
+
+```sh
+chalk agents list
+```
+
+### CLI agents
+
+`builtin` and `external` work with any image.
+A CLI agent also has to be installed in the image at build time, so setting `agent` in the run config isn't enough.
+Add it when you create the environment:
+
+```sh
+chalk create-env my_env --agent mistral-vibe
+```
+
+or add it to an existing environment and rebuild:
+
+```sh
+uv run chalk agents add mistral-vibe
+uv run chalk build
+```
+
+Both commands record the agent in the environment's `.manifest.json`.
+During the image build, `chalk agents install` installs the pinned version; it only works inside a build.
+`chalk agents remove <name>` removes an agent from the manifest, and the next build leaves it out.
+
+CLI agents differ from `builtin` in a few ways:
+
+- They run as the student and call the tool server directly.
+  If they bring their own tools, those replace the task's tools that do the same job; their shell replaces `bash`, for example.
+- They send their own system prompt instead of the task's.
+- `reasoning_effort` isn't applied, except by `grok-build`, `claude-code`, `codex` and `agy`.
+- The student's firewall only lets them reach localhost and the model proxy.
+  Without a proxy (no `--proxy` and no plugin default), Chalk listens on a local port and forwards the agent's model calls from there to the provider, adding the API key itself.
+  The agent gets a placeholder key, so the real one never reaches the student.
+- `mistral-vibe` sends its calls to `<proxy>/v1` as an OpenAI-compatible endpoint, or through that forwarder to Mistral's API when there's no proxy.
+  `grok-build` does the same with the proxy, or goes through the forwarder to xAI's API without one.
+  `claude-code` sends Anthropic-style calls to `<proxy>/v1/messages`, or through the forwarder to Anthropic's API.
+  When the run has an API key, `claude-code` reaches the proxy through the forwarder too, so the key still never reaches the student.
+  `codex` sends OpenAI Responses calls to `<proxy>/v1/responses`, or through the forwarder to OpenAI's API.
+  `agy` sends Gemini API calls to `<proxy>/v1beta/models/<model>`.
+  Without a proxy, `gemini/` models go through the forwarder to Google's Gemini API, and `vertex_ai/` models go through it to Vertex AI.
+
+`grok-build` specifics:
+
+- All steps of a run share one Grok session, so later steps see the earlier conversation.
+- A step ends when the model's turn ends. Grok runs with `--no-wait-for-background`, so background jobs still running then don't wake the model for more turns.
+- Grok doesn't list MCP tools to the model directly. The model finds the task's tools with `search_tool` and calls them through `use_tool` (as `chalk__<tool>`), and the transcript records those calls as `use_tool`.
+- Grok's web search, image editing, feedback and ask-the-user tools are turned off, along with its telemetry and update checks.
+- It sends `temperature` and `reasoning_effort` when the run config sets them.
+
+`claude-code` specifics:
+
+- All steps of a run share one Claude Code session, so later steps see the earlier conversation.
+- It runs Anthropic models, and models on a server you run that serves Anthropic's `/v1/messages` API, as vLLM and SGLang do.
+  Name such a model `hosted_vllm/<the server's name for it>` and point `--proxy` at the server.
+  (`hosted_vllm` is litellm's prefix for any self-hosted OpenAI-compatible server, not only vLLM.)
+- On a `hosted_vllm` model, Claude Code's model aliases (`haiku`, `sonnet`, `opus`, `fable`) and the models it picks for background calls and subagents all name that model, since the server has no Claude models.
+- The model sees the task's tools as `mcp__chalk__<tool>`, and the transcript records them under that name.
+- Claude Code's web search, web fetch and ask-the-user tools are turned off, along with its telemetry, error reporting and update checks.
+- It sends `reasoning_effort` when the run config sets it.
+  It can't send `temperature`, so a run config that sets it is rejected.
+- On an Anthropic model, the transcript's reasoning is Anthropic's summary of the model's thinking; the raw thinking isn't available.
+- On a `hosted_vllm` model, Claude Code doesn't ask for thinking, since SGLang refuses that request from a server without a reasoning parser.
+  Whether the model thinks is up to its chat template; a Qwen3.5+ model thinks by default.
+- On a `hosted_vllm` model, Claude Code doesn't send a reasoning effort either.
+  SGLang hands it to the model's chat template, and some templates refuse efforts they don't define (Qwen3.8 takes only `xhigh`, `medium` and `low`), so the template's own default applies.
+
+`codex` specifics:
+
+- All steps of a run share one Codex session, so later steps see the earlier conversation.
+- Codex reports what the model did, not each model response.
+  The transcript has one assistant message per group of tool calls Codex runs together, carrying the text and reasoning that came before them, and one token usage entry per step.
+- Its shell, file-editing and image tools replace `bash`, `replace_in_file` and `view_image_file`.
+  The transcript records them as `exec_command` and `apply_patch`, and the task's tools as `mcp__chalk__<tool>`.
+- Codex's hosted web search, telemetry and feedback are turned off.
+  Its own command sandbox is off, since it can't run inside a container; the student's sandbox still applies.
+- It sends `reasoning_effort` when the run config sets it.
+  It can't send `temperature` or stop at `turn_limit`, so a run config that sets either is rejected.
+- The transcript's reasoning is OpenAI's summary of the model's reasoning.
+
+`agy` specifics:
+
+- All steps of a run share one agy conversation, so later steps see the earlier conversation.
+- Chalk passes the run's model to agy unchanged, so it works with any Gemini model the provider serves, such as `vertex_ai/gemini-4-argon`.
+  Gemini 4 Argon also needs `reasoning_effort`: without it, agy asks for a thinking budget, and the first model call fails with Gemini's error.
+- For `vertex_ai/` models without a proxy, the forwarder uses the harness's Google credentials, found the same way litellm finds them.
+  That's `VERTEXAI_CREDENTIALS` if set, else the application default credentials.
+  The project is `VERTEXAI_PROJECT`, or the credentials' own project.
+  The location is `VERTEXAI_LOCATION` or `VERTEX_LOCATION`, or `global` if neither is set.
+  It needs `google-auth`, which `chalk-rl-env[gcs]` installs.
+  It only passes on calls that generate content, so agy can't use those credentials for anything else.
+- Its shell and file tools replace `bash`, `view_lines_in_file`, `view_image_file` and `replace_in_file`.
+  The transcript records them under agy's names, such as `run_command`, `view_file` and `write_to_file`, and the task's tools as `mcp__chalk__<tool>`.
+  Some of agy's tool results are summaries: for `view_file`, the transcript shows the file's size rather than its content.
+  File writes and edits, such as `write_to_file` and `replace_file_content`, record only the target file, not what agy changed in it.
+- agy's telemetry and self-update are turned off.
+  agy also asks `gemini-3.1-flash-lite-preview` for a title for the conversation; where that model isn't available, the call fails and the run goes on.
+- It sends `reasoning_effort` when the run config sets it.
+  It can't send `temperature` or stop at `turn_limit`, so a run config that sets either is rejected.
+- The transcript has no reasoning, because agy doesn't output it.
+  Each model response's token usage counts thinking tokens as output.
+
+## Fake model
+
+The fake model replays messages you write in advance, so you can test your tools, hooks and judges without waiting for or paying for a real model.
+It needs no API key.
+To use it, set `use_fake_model` to `true` and write a `get_messages` function in `src/environment/fake_model.py`.
+The `default` template includes one:
+
+```python
+from chalk import EvaluationRunConfig
+from chalk.schemas import Message
+
+
+def get_messages(config: EvaluationRunConfig) -> list[Message]:
+    return [
+        Message(role="assistant", content="path: /workdir/.venv/bin/python"),
+    ]
+```
+
+Each turn uses the next message in the list.
+A message with text and no tool calls ends the step, so finish each step with one.
+If the list runs out, the run fails.
+
+`use_fake_model` takes the place of whatever agent the config names.
+
+## Model endpoints and proxies
+
+`chalk run --proxy <url>` sends model calls to `<url>` instead of to the provider.
+Pass the base URL without `/v1`:
+
+- Claude models go to `<url>/v1/messages`.
+  Chalk sets `ANTHROPIC_BASE_URL` to `<url>` inside the container, and litellm adds `/v1/messages`.
+- Other models go to `<url>/v1`, so the endpoint needs an OpenAI-compatible API there.
+
+You can use the same flag to point Chalk at any endpoint that serves these paths.
+The URL is used from inside the container, so `localhost` means the container, not your machine.
+Variables like `ANTHROPIC_BASE_URL` set in your shell don't reach the container.
+
+The endpoint may not require a key and instead inject its own key.
+Chalk always sends a key, though, so if the key's variable isn't set, `--proxy` fills in a placeholder for both the run's model and the judge model.
+
+If you don't pass `--proxy`, Chalk uses the URL a plugin registers under `chalk.default_proxy_url` (see [Plugins](../extending/plugins.md)).
+Without such a plugin, calls go directly to the provider, and a CLI agent's calls go through the forwarder described in [CLI agents](#cli-agents).
+`--no-proxy` ignores the plugin's URL.

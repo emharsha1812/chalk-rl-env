@@ -1,0 +1,11 @@
+Manrope: Copyright 2019 The Manrope Project Authors.
+Source: https://github.com/google/fonts/tree/main/ofl/manrope
+License: SIL Open Font License 1.1; see OFL-Manrope.txt and FONTLOG-Manrope.txt.
+
+Caveat: Copyright 2014 The Caveat Project Authors.
+Source: https://github.com/google/fonts/tree/main/ofl/caveat
+License: SIL Open Font License 1.1; see OFL-Caveat.txt.
+
+IBM Plex Mono: Copyright IBM Corp.
+Source: https://github.com/google/fonts/tree/main/ofl/ibmplexmono
+License: SIL Open Font License 1.1; see OFL-IBMPlexMono.txt.

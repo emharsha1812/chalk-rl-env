@@ -1,0 +1,81 @@
+# Scratch envs for the template tests. Not under /tmp: Apple `container`
+# builds lose directory contents from a context under a symlinked path.
+test_root := env_var("HOME") + "/.cache/chalk/test-templates"
+
+_default:
+  @just --list
+
+# Static analysis
+lint:
+  uv run --frozen --extra dev ruff format --check
+  uv run --frozen --extra dev ruff check
+  uv run --frozen --extra dev basedpyright
+  uv run --frozen --extra dev scripts/check_supply_chain_config.py
+
+# Auto-format and apply automatic fixes for linting
+fix:
+  uv run --frozen --extra dev ruff format
+  uv run --frozen --extra dev ruff check --fix
+
+# Preview the built docs at http://127.0.0.1:8000/docs/
+docs *args:
+  uv run --frozen --group docs python scripts/preview_sites.py --site docs {{ args }}
+
+# Build the docs into site/, failing on broken links
+docs-build:
+  uv run --frozen --group docs python scripts/build_sites.py --site docs
+
+# Build and preview the separate public website
+website-build:
+  uv run --frozen --group docs python scripts/build_sites.py --site website
+
+website *args:
+  uv run --frozen --group docs python scripts/preview_sites.py --site website {{ args }}
+
+# Run tests for chalk
+test *args:
+  uv run --frozen --extra test pytest {{ args }}
+
+# Run the `requires_root` tests as root. Serial: they share uids.
+test-root:
+  sudo -E env HOME=/root PATH="$PATH" \
+    "$(uv run --frozen --extra test python -c 'import sys; print(sys.executable)')" \
+    -m pytest -m requires_root --numprocesses=0 -p no:cacheprovider \
+    $(grep -l requires_root tests/test_*.py)
+
+# Run tests for templates
+test-template template *run_args:
+  rm -rf {{ test_root }}/test_{{ template }}
+  mkdir -p {{ test_root }}
+
+  uv run --frozen chalk create-env {{ test_root }}/test_{{ template }} --template {{ template }} --vendor-chalk
+
+  cd {{ test_root }}/test_{{ template }} && uv run setup_data.py
+
+  cd {{ test_root }}/test_{{ template }} && uv run --extra dev just lint
+  cd {{ test_root }}/test_{{ template }} && uv run --extra dev just test
+  just test-run-config {{ test_root }}/test_{{ template }}
+  cd {{ test_root }}/test_{{ template }} && uv run chalk run --config run_config.json --no-ui --no-proxy {{ run_args }}
+  cd {{ test_root }}/test_{{ template }} && uv run python {{ justfile_directory() }}/tests/check_transcript.py out/transcript.json
+
+# Run config for template tests; set CHALK_TEST_FAKE_MODEL to use the env's fake model instead of an API key
+test-run-config dir:
+  cd {{ dir }} && uv run chalk create-run-config --model claude-haiku-4-5-20251001
+  if [ -n "${CHALK_TEST_FAKE_MODEL:-}" ]; then jq '.use_fake_model = true' {{ dir }}/run_config.json > {{ dir }}/run_config.json.tmp && mv {{ dir }}/run_config.json.tmp {{ dir }}/run_config.json; fi
+
+# `test-template` for language-toolchains
+test-toolchains-template container_cmd="docker" *run_args:
+  rm -rf {{ test_root }}/test_language-toolchains
+  mkdir -p {{ test_root }}
+
+  uv run --frozen chalk create-env {{ test_root }}/test_language-toolchains --template language-toolchains --vendor-chalk
+
+  cd {{ test_root }}/test_language-toolchains && uv run setup_data.py
+
+  cd {{ test_root }}/test_language-toolchains && uv run --extra dev just lint
+  cd {{ test_root }}/test_language-toolchains && uv run --extra dev just test
+  cd {{ test_root }}/test_language-toolchains && uv run --extra dev just enable-all-toolchains
+  cd {{ test_root }}/test_language-toolchains && uv run chalk create-run-config --model claude-haiku-4-5-20251001
+  cd {{ test_root }}/test_language-toolchains && uv run chalk run --config run_config.json --no-ui --no-proxy {{ run_args }}
+  cd {{ test_root }}/test_language-toolchains && uv run python {{ justfile_directory() }}/tests/check_transcript.py out/transcript.json
+  cd {{ test_root }}/test_language-toolchains && uv run --extra dev just check-toolchains chalk '' '{{ container_cmd }}'

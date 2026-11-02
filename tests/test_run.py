@@ -1,0 +1,1769 @@
+import functools
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+import typer
+
+from chalk.cli.run import (
+    PROXY_ENTRY_POINT_GROUP,
+    _run_without_ui,  # pyright: ignore[reportPrivateUsage]
+    default_proxy_url,
+    run,
+)
+from chalk.env_source import SourceError, image_name_for
+from chalk.forwarded_env import EXIT_ON_RUN_ERROR_ENV_VAR
+from chalk.run_helpers import build_configs, sanitize_paths
+from chalk.runtime import Runtime
+from chalk.schemas.evaluation_run_config import EvaluationRunConfig
+from chalk.schemas.http_mcp_server_config import HttpMcpServerConfig
+from chalk.schemas.transcript import ErrorEvent
+from tests.conftest import register_hardware_plugins
+
+
+@pytest.fixture(autouse=True)
+def _stub_process_hardening():  # pyright: ignore[reportUnusedFunction]
+    """run() calls sanitize_paths_and_reexec(), which sanitizes process-global env
+    vars in place and re-execs. pytest can't revert either, so a real call would
+    strip non-root PATH entries (e.g. nix-store paths holding `uv`) or replace the
+    test process. These tests exercise run()'s orchestration, so stub it out.
+
+    harden_filesystem() goes with it: a test that sets CHALK_CONTAINERIZED would
+    otherwise chmod the machine's own /dev/mqueue when this suite runs on Linux.
+    """
+    with (
+        patch("chalk.cli.run.sanitize_paths_and_reexec"),
+        patch("chalk.cli.run.harden_filesystem"),
+        patch("chalk.build.which", return_value="/usr/bin/engine"),
+        patch("chalk.build._buildx_available", return_value=True),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _docker_by_default(monkeypatch: pytest.MonkeyPatch):  # pyright: ignore[reportUnusedFunction]
+    """The real default depends on the OS running the tests and its VM setup."""
+    # The package re-exports the `run` function under the module's name.
+    monkeypatch.setattr(
+        sys.modules["chalk.cli.run"],
+        "default_runtime",
+        lambda _hardware=None: "docker",  # pyright: ignore[reportUnknownLambdaType]
+    )
+
+
+@pytest.fixture
+def in_chalk_image(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHALK_CONTAINERIZED", "1")
+
+
+def test_raises_error_if_trying_to_run_multiple_runs_without_containerization(
+    capsys: pytest.CaptureFixture[str],
+):
+    with pytest.raises(typer.Abort):
+        run(config="", containerized=False, n_parallel=2)
+
+    _, stderr = capsys.readouterr()
+    assert "Cannot run multiple runs without containerization." in stderr
+
+
+def test_raises_error_if_trying_to_mount_dev_files_without_containerization(
+    capsys: pytest.CaptureFixture[str],
+):
+    with pytest.raises(typer.Abort):
+        run(config="", containerized=False, dev=True)
+
+    _, stderr = capsys.readouterr()
+    assert "Cannot use the `--dev` option without containerization." in stderr
+
+
+def test_raises_error_if_trying_to_keep_containers_without_containerization(
+    capsys: pytest.CaptureFixture[str],
+):
+    with pytest.raises(typer.Abort):
+        run(config="", containerized=False, keep_containers=True)
+
+    _, stderr = capsys.readouterr()
+    assert (
+        "Cannot use the `--keep-containers` option without containerization." in stderr
+    )
+
+
+@pytest.mark.parametrize("prepare_only", [False, True])
+def test_no_containerized_aborts_outside_a_chalk_container(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    prepare_only: bool,
+):
+    monkeypatch.delenv("CHALK_CONTAINERIZED", raising=False)
+    with (
+        patch("chalk.cli.run.parse_config") as parse,
+        pytest.raises(typer.Abort),
+    ):
+        run(config="{}", containerized=False, prepare_only=prepare_only)
+
+    assert capsys.readouterr().err.strip() == (
+        "--no-containerized only runs inside a chalk container image; "
+        + "drop the flag to run in a container."
+    )
+    parse.assert_not_called()
+
+
+def test_raises_error_if_trying_to_prepare_only_with_parallel_runs(
+    capsys: pytest.CaptureFixture[str],
+):
+    with pytest.raises(typer.Abort):
+        run(config="", n_parallel=2, prepare_only=True)
+
+    _, stderr = capsys.readouterr()
+    assert "Cannot use --prepare-only with --n-parallel > 1." in stderr
+
+
+@pytest.fixture(autouse=True)
+def _restore_proxy_env(monkeypatch: pytest.MonkeyPatch):  # pyright: ignore[reportUnusedFunction]
+    """Uncontainerized runs with a proxy export it into os.environ."""
+    for var in ("CHALK_PROXY_URL", "ANTHROPIC_BASE_URL"):
+        monkeypatch.setenv(var, "")
+        monkeypatch.delenv(var)
+
+
+class TestFirecrackerLaunchErrors:
+    @patch("chalk.cli.run._print_output_paths")
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_a_vm_that_cant_start_fails_only_its_run(
+        self, _build: MagicMock, _cleanup: MagicMock, _paths: MagicMock
+    ):
+        """E.g. pasta can't start for one run: that run fails, the rest still run,
+        and nothing escapes as a traceback."""
+        from chalk.firecracker.network import NetworkError
+
+        ran: list[str] = []
+
+        def run_containerized(config: EvaluationRunConfig, **_kwargs: object) -> None:
+            if config.run_id == "b":
+                raise NetworkError("pasta can't set up a network namespace here")
+            ran.append(config.run_id)
+
+        configs = [
+            EvaluationRunConfig(run_id=r, task_id="t", model="m", model_api_key="k")
+            for r in ("a", "b", "c")
+        ]
+        with patch("chalk.cli.run.run_containerized", run_containerized):
+            with pytest.raises(typer.Exit) as exc_info:
+                _run_without_ui(
+                    configs, "firecracker", True, ".", keep_containers=False
+                )
+
+        assert exc_info.value.exit_code == 1
+        assert sorted(ran) == ["a", "c"]
+
+
+class TestRunWithoutUiCache:
+    """Test that _run_without_ui forwards cache args to build_container."""
+
+    def _make_config(self) -> MagicMock:
+        config = MagicMock()
+        config.run_id = "test-run"
+        config.transcript_file = None
+        return config
+
+    @patch("chalk.cli.run.run_containerized")
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_forwards_cache_from(
+        self, mock_build: MagicMock, _mock_cleanup: MagicMock, _mock_run: MagicMock
+    ):
+        _run_without_ui(
+            [self._make_config()],
+            "podman",
+            False,
+            ".",
+            keep_containers=False,
+            cache_from=["type=registry,ref=repo:cache"],
+        )
+
+        mock_build.assert_called_once_with(
+            "podman",
+            ".",
+            cache_from=["type=registry,ref=repo:cache"],
+            cache_to=None,
+            build_secrets=(),
+        )
+
+    @patch("chalk.cli.run.run_containerized")
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_forwards_cache_to(
+        self, mock_build: MagicMock, _mock_cleanup: MagicMock, _mock_run: MagicMock
+    ):
+        _run_without_ui(
+            [self._make_config()],
+            "podman",
+            False,
+            ".",
+            keep_containers=False,
+            cache_to=["type=local,dest=/tmp/cache"],
+            build_secrets=(),
+        )
+
+        mock_build.assert_called_once_with(
+            "podman",
+            ".",
+            cache_from=None,
+            cache_to=["type=local,dest=/tmp/cache"],
+            build_secrets=(),
+        )
+
+    @patch("chalk.cli.run.run_containerized")
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_forwards_both_cache_args(
+        self, mock_build: MagicMock, _mock_cleanup: MagicMock, _mock_run: MagicMock
+    ):
+        _run_without_ui(
+            [self._make_config()],
+            "podman",
+            False,
+            ".",
+            keep_containers=False,
+            cache_from=["type=registry,ref=a"],
+            cache_to=["type=registry,ref=b"],
+            build_secrets=(),
+        )
+
+        mock_build.assert_called_once_with(
+            "podman",
+            ".",
+            cache_from=["type=registry,ref=a"],
+            cache_to=["type=registry,ref=b"],
+            build_secrets=(),
+        )
+
+    @patch("chalk.cli.run.run_containerized")
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_no_cache_args_by_default(
+        self, mock_build: MagicMock, _mock_cleanup: MagicMock, _mock_run: MagicMock
+    ):
+        _run_without_ui(
+            [self._make_config()], "podman", False, ".", keep_containers=False
+        )
+
+        mock_build.assert_called_once_with(
+            "podman", ".", cache_from=None, cache_to=None, build_secrets=()
+        )
+
+    @patch("chalk.cli.run.run_containerized")
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_forwards_build_secrets(
+        self, mock_build: MagicMock, _mock_cleanup: MagicMock, _mock_run: MagicMock
+    ):
+        _run_without_ui(
+            [self._make_config()],
+            "podman",
+            False,
+            ".",
+            keep_containers=False,
+            build_secrets=["uv_env=/tmp/uv_env"],
+        )
+
+        mock_build.assert_called_once_with(
+            "podman",
+            ".",
+            cache_from=None,
+            cache_to=None,
+            build_secrets=["uv_env=/tmp/uv_env"],
+        )
+
+    @patch("chalk.cli.run.run_containerized")
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_tells_each_run_how_many_were_launched_together(
+        self, _mock_build: MagicMock, _mock_cleanup: MagicMock, mock_run: MagicMock
+    ):
+        """A VM runtime splits the host's free disk between them."""
+        configs = build_configs(self._make_config(), 3)
+
+        _run_without_ui(configs, "firecracker", False, ".", keep_containers=False)
+
+        assert mock_run.call_count == 3
+        assert {c.kwargs["parallel_runs"] for c in mock_run.call_args_list} == {3}
+
+    @patch("chalk.cli.run.run_containerized")
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_skips_build_in_dev_mode(
+        self, mock_build: MagicMock, _mock_cleanup: MagicMock, _mock_run: MagicMock
+    ):
+        _run_without_ui(
+            [self._make_config()],
+            "podman",
+            True,
+            ".",
+            keep_containers=False,
+            cache_from=["repo:cache"],
+        )
+
+        mock_build.assert_not_called()
+
+
+def _register_proxies(monkeypatch: pytest.MonkeyPatch, **urls: object) -> None:
+    def fake_entry_points(*, group: str) -> list[SimpleNamespace]:
+        assert group == PROXY_ENTRY_POINT_GROUP
+
+        def loader(url: object) -> object:
+            if isinstance(url, Exception):
+                raise url
+            return url
+
+        return [
+            SimpleNamespace(name=name, load=functools.partial(loader, url))
+            for name, url in urls.items()
+        ]
+
+    monkeypatch.setattr(sys.modules["chalk.cli.run"], "entry_points", fake_entry_points)
+
+
+class TestDefaultProxyUrl:
+    def test_none_without_a_plugin(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch)
+        assert default_proxy_url() is None
+
+    def test_an_installed_plugin_provides_it(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch, internal="https://proxy.example")
+        assert default_proxy_url() == "https://proxy.example"
+
+    def test_the_first_plugin_by_name_wins(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch, b="https://b.example", a="https://a.example")
+        assert default_proxy_url() == "https://a.example"
+
+    def test_a_broken_plugin_is_skipped(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch, a=ImportError("gone"), b="https://proxy.example")
+        assert default_proxy_url() == "https://proxy.example"
+
+
+@pytest.mark.usefixtures("in_chalk_image")
+class TestProxyApiKeyFallback:
+    """With a proxy, an unset variable the config reads its key from gets a placeholder."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_keys(self, monkeypatch: pytest.MonkeyPatch):
+        for var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            monkeypatch.setenv(var, "")
+            monkeypatch.delenv(var)
+
+    def _run_with_proxy(
+        self, *, proxy: str | None = "https://proxy.example", no_proxy: bool = False
+    ) -> None:
+        """Call run() with enough mocked out to test only the proxy/api-key logic."""
+        run_config = EvaluationRunConfig(
+            run_id="test",
+            task_id="example-task",
+            model="openai/gpt-5.5",
+            mcp_server_config=HttpMcpServerConfig(),
+        )
+        mock_task = MagicMock()
+        with (
+            patch("chalk.cli.run.parse_config", return_value=run_config),
+            patch("chalk.cli.run.load_task", return_value=mock_task),
+            patch(
+                "chalk.mcp_servers.http_mcp_server.run_server",
+                return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()),
+            ),
+            patch("chalk.cli.run.anyio", run=MagicMock(return_value=None)),
+        ):
+            run(
+                config=run_config.model_dump_json(),
+                containerized=False,
+                proxy=proxy,
+                no_proxy=no_proxy,
+            )
+
+    def test_proxy_sets_a_placeholder_when_unset(self):
+        self._run_with_proxy()
+
+        assert os.environ["OPENAI_API_KEY"] == "model_api_key"
+
+    def test_proxy_preserves_a_set_variable(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+
+        self._run_with_proxy()
+
+        assert os.environ["OPENAI_API_KEY"] == "sk-real"
+
+    def test_proxy_leaves_other_providers_variables_alone(self):
+        self._run_with_proxy()
+
+        assert "ANTHROPIC_API_KEY" not in os.environ
+
+    def test_no_proxy_does_not_set_the_variable(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch, internal="https://proxy.example")
+
+        self._run_with_proxy(no_proxy=True)
+
+        assert "OPENAI_API_KEY" not in os.environ
+
+    def test_no_proxy_by_default(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch)
+
+        self._run_with_proxy(proxy=None)
+
+        assert "OPENAI_API_KEY" not in os.environ
+
+    def test_a_plugin_proxy_is_the_default(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch, internal="https://proxy.example")
+
+        self._run_with_proxy(proxy=None)
+
+        assert os.environ["OPENAI_API_KEY"] == "model_api_key"
+
+
+@pytest.mark.usefixtures("in_chalk_image")
+class TestProxyPlaceholderForReferencedKey:
+    """A keyless proxy works whichever variable the config's key refers to."""
+
+    def _run(self, config: str, proxy: str | None) -> MagicMock:
+        with (
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch(
+                "chalk.mcp_servers.http_mcp_server.run_server",
+                return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()),
+            ),
+            patch("chalk.cli.run.anyio") as mock_anyio,
+        ):
+            run(config=config, containerized=False, proxy=proxy, no_proxy=not proxy)
+        return mock_anyio
+
+    def _config(self, key: str | None, **fields: Any) -> str:
+        return EvaluationRunConfig(
+            run_id="test",
+            task_id="example-task",
+            model="openai/gpt-5.5",
+            model_api_key=key,
+            **fields,
+        ).model_dump_json()
+
+    @pytest.fixture(autouse=True)
+    def _restore_keys(self, monkeypatch: pytest.MonkeyPatch):
+        for var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MY_RUBRIC_KEY"):
+            monkeypatch.setenv(var, "")
+
+    def test_fills_in_the_referenced_variable(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        mock_anyio = self._run(self._config("$OPENAI_API_KEY"), "https://proxy.example")
+
+        run_config = mock_anyio.run.call_args.args[1]
+        assert run_config.model_api_key == "model_api_key"
+
+    def test_keeps_a_set_variable(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+
+        mock_anyio = self._run(self._config("$OPENAI_API_KEY"), "https://proxy.example")
+
+        assert mock_anyio.run.call_args.args[1].model_api_key == "sk-real"
+
+    def test_reads_the_reference_from_a_config_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config_file = tmp_path / "config.json"
+        config_file.write_text(self._config("$OPENAI_API_KEY"))
+
+        mock_anyio = self._run(str(config_file), "https://proxy.example")
+
+        assert mock_anyio.run.call_args.args[1].model_api_key == "model_api_key"
+
+    def test_fills_in_the_models_variable_when_the_config_has_no_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        mock_anyio = self._run(self._config(None), "https://proxy.example")
+
+        assert mock_anyio.run.call_args.args[1].model_api_key == "model_api_key"
+
+    def test_fills_in_the_rubric_judge_reference(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("MY_RUBRIC_KEY", raising=False)
+        config = self._config("sk-real", rubric_judge_api_key="$MY_RUBRIC_KEY")
+
+        mock_anyio = self._run(config, "https://proxy.example")
+
+        assert mock_anyio.run.call_args.args[1].rubric_judge_api_key == "model_api_key"
+
+    def test_fills_in_the_rubric_judge_models_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = self._config("sk-real", rubric_judge_model="openai/gpt-5.5")
+
+        mock_anyio = self._run(config, "https://proxy.example")
+
+        assert mock_anyio.run.call_args.args[1].rubric_judge_api_key == "model_api_key"
+
+    def test_without_a_proxy_an_unset_variable_still_aborts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        with pytest.raises(typer.Abort):
+            self._run(self._config("$OPENAI_API_KEY"), None)
+
+
+@pytest.mark.usefixtures("in_chalk_image")
+class TestConfigFromFlags:
+    """--task, --model and friends build the run config or override --config."""
+
+    @pytest.fixture(autouse=True)
+    def _keys(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-anthropic")
+        monkeypatch.setenv("MY_KEY", "sk-mine")
+
+    def _run(self, **kwargs: Any) -> EvaluationRunConfig:
+        with (
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch(
+                "chalk.mcp_servers.http_mcp_server.run_server",
+                return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()),
+            ),
+            patch("chalk.cli.run.anyio") as mock_anyio,
+        ):
+            run(containerized=False, no_proxy=True, **kwargs)
+        return mock_anyio.run.call_args.args[1]
+
+    def _config(self, **fields: Any) -> str:
+        return EvaluationRunConfig(
+            run_id="from-config",
+            task_id="config-task",
+            model="openai/gpt-5.5",
+            **fields,
+        ).model_dump_json()
+
+    def test_task_and_model_are_enough(self):
+        run_config = self._run(task="example-task", model="openai/gpt-5.5")
+
+        assert run_config.task_id == "example-task"
+        assert run_config.model == "openai/gpt-5.5"
+        assert re.fullmatch(r"[0-9a-f]{8}", run_config.run_id)
+        assert run_config.transcript_file == "out/transcript.json"
+        assert run_config.model_api_key == "sk-openai"
+
+    @pytest.mark.parametrize(
+        ("flags", "missing"),
+        [
+            ({"model": "openai/gpt-5.5"}, "--task"),
+            ({"task": "example-task"}, "--model"),
+            ({}, "--task and --model"),
+        ],
+    )
+    def test_without_a_config_task_and_model_are_required(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        flags: dict[str, str],
+        missing: str,
+    ):
+        with pytest.raises(typer.Abort):
+            self._run(**flags)
+
+        assert missing in capsys.readouterr().err
+
+    def test_the_other_flags_are_applied(self):
+        run_config = self._run(
+            task="example-task",
+            model="openai/gpt-5.5",
+            model_api_key="$MY_KEY",
+            reasoning_effort="max",
+            max_output_tokens=512,
+            transcript_file="elsewhere/t.json",
+        )
+
+        assert run_config.model_api_key == "sk-mine"
+        assert run_config.reasoning_effort == "max"
+        assert run_config.max_output_tokens == 512
+        assert run_config.transcript_file == "elsewhere/t.json"
+
+    def test_the_temperature_flag_is_applied(self):
+        run_config = self._run(
+            task="example-task",
+            model="claude-haiku-4-5-20251001",
+            temperature=0.3,
+        )
+
+        assert run_config.temperature == 0.3
+
+    def test_the_agent_flag_is_applied(self):
+        run_config = self._run(
+            config=self._config(agent="builtin"), agent="claude-code"
+        )
+
+        assert run_config.agent == "claude-code"
+
+    def test_the_key_can_come_from_a_file(self, tmp_path: Path):
+        key_file = tmp_path / "key"
+        key_file.write_text("sk-from-file")
+
+        run_config = self._run(
+            task="example-task",
+            model="openai/gpt-5.5",
+            model_api_key_file=str(key_file),
+        )
+
+        assert run_config.model_api_key == "sk-from-file"
+
+    def test_flags_override_a_config(self):
+        run_config = self._run(
+            config=self._config(turn_limit=7),
+            task="example-task",
+            model="claude-fable-5",
+            model_api_key="sk-literal",
+        )
+
+        assert run_config.run_id == "from-config"
+        assert run_config.task_id == "example-task"
+        assert run_config.model == "claude-fable-5"
+        assert run_config.model_api_key == "sk-literal"
+        assert run_config.turn_limit == 7
+
+    def test_flags_override_a_config_file(self, tmp_path: Path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(self._config(transcript_file="out/t.json"))
+
+        run_config = self._run(config=str(config_file), model="claude-fable-5")
+
+        assert run_config.model == "claude-fable-5"
+        assert run_config.task_id == "config-task"
+        assert run_config.transcript_file == "out/t.json"
+
+    def test_unset_flags_leave_a_config_alone(self):
+        run_config = self._run(config=self._config())
+
+        assert run_config.task_id == "config-task"
+        assert run_config.transcript_file is None
+
+    def test_a_proxy_fills_in_the_key_for_the_flags_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("OPENAI_API_KEY")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+        monkeypatch.delenv("ANTHROPIC_API_KEY")
+        with (
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch(
+                "chalk.mcp_servers.http_mcp_server.run_server",
+                return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()),
+            ),
+            patch("chalk.cli.run.anyio") as mock_anyio,
+        ):
+            run(
+                config=self._config(),
+                model="claude-fable-5",
+                containerized=False,
+                proxy="https://proxy.example",
+            )
+
+        assert mock_anyio.run.call_args.args[1].model_api_key == "model_api_key"
+
+
+class TestUncontainerizedProxyEnv:
+    """With --no-containerized, the proxy is applied to this process's environment."""
+
+    PROXY_VARS: tuple[str, ...] = ("CHALK_PROXY_URL", "ANTHROPIC_BASE_URL")
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CHALK_CONTAINERIZED", "1")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+
+    def _run(
+        self, *, proxy: str | None = None, no_proxy: bool = False
+    ) -> dict[str, str | None]:
+        run_config = EvaluationRunConfig(
+            run_id="test", task_id="example-task", model="m", model_api_key="k"
+        )
+        seen: dict[str, str | None] = {}
+
+        def record(*_args: object) -> None:
+            seen.update({var: os.environ.get(var) for var in self.PROXY_VARS})
+
+        with (
+            patch("chalk.cli.run.parse_config", return_value=run_config),
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch(
+                "chalk.mcp_servers.http_mcp_server.run_server",
+                return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()),
+            ),
+            patch("chalk.cli.run.anyio.run", side_effect=record),
+        ):
+            run(config="{}", containerized=False, proxy=proxy, no_proxy=no_proxy)
+        return seen
+
+    def test_an_explicit_proxy_is_applied(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch)
+
+        seen = self._run(proxy="https://proxy.example")
+
+        assert seen == {
+            "CHALK_PROXY_URL": "https://proxy.example",
+            "ANTHROPIC_BASE_URL": "https://proxy.example",
+        }
+
+    def test_nothing_is_set_without_a_proxy(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch)
+
+        assert self._run() == {"CHALK_PROXY_URL": None, "ANTHROPIC_BASE_URL": None}
+
+    def test_no_proxy_sets_nothing(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch, internal="https://plugin.example")
+
+        seen = self._run(no_proxy=True)
+
+        assert seen == {"CHALK_PROXY_URL": None, "ANTHROPIC_BASE_URL": None}
+
+    @pytest.mark.parametrize("preset", PROXY_VARS)
+    def test_an_environment_that_already_routes_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch, preset: str
+    ):
+        _register_proxies(monkeypatch, internal="https://plugin.example")
+        monkeypatch.setenv(preset, "https://backend.example")
+
+        seen = self._run(proxy="https://proxy.example")
+
+        assert seen == {
+            var: "https://backend.example" if var == preset else None
+            for var in self.PROXY_VARS
+        }
+
+    def test_a_plugin_proxy_is_not_applied(self, monkeypatch: pytest.MonkeyPatch):
+        _register_proxies(monkeypatch, internal="https://plugin.example")
+
+        seen = self._run()
+
+        assert seen == {"CHALK_PROXY_URL": None, "ANTHROPIC_BASE_URL": None}
+
+
+def test_tui_receives_the_cache_options(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHALK_CONTAINERIZED", "")
+    monkeypatch.delenv("CHALK_CONTAINERIZED")
+    run_config = EvaluationRunConfig(
+        run_id="r", task_id="t", model="m", model_api_key="k"
+    )
+    with (
+        patch("chalk.cli.run.parse_config", return_value=run_config),
+        patch("chalk.cli.run.load_task", return_value=MagicMock()),
+        patch("chalk.terminal.app.ChalkApp") as mock_app_cls,
+    ):
+        mock_app_cls.return_value.run_failed = False
+        run(
+            config="{}",
+            cache_from=["type=registry,ref=repo:cache"],
+            cache_to=["type=registry,ref=repo:cache,mode=max"],
+        )
+
+    app = mock_app_cls.return_value
+    assert app.cache_from == ["type=registry,ref=repo:cache"]
+    assert app.cache_to == ["type=registry,ref=repo:cache,mode=max"]
+    app.run.assert_called_once()
+
+
+@pytest.mark.usefixtures("in_chalk_image")
+def test_run_uses_the_preprocessed_config(monkeypatch: pytest.MonkeyPatch):
+    from chalk.judges.rubric_judge import RubricJudge
+
+    monkeypatch.setattr(RubricJudge, "default_api_key", None)
+    parsed = EvaluationRunConfig(run_id="r", task_id="t", model="m", model_api_key="k")
+    preprocessed = parsed.model_copy(
+        update={"rubric_judge_api_key": "from-preprocessor"}
+    )
+    with (
+        patch("chalk.cli.run.parse_config", return_value=parsed),
+        patch(
+            "chalk.cli.run.apply_run_config_preprocessors",
+            return_value=preprocessed,
+        ) as preprocess,
+        patch("chalk.cli.run.load_task", return_value=MagicMock()),
+        patch(
+            "chalk.mcp_servers.http_mcp_server.run_server",
+            return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()),
+        ),
+        patch("chalk.cli.run.anyio", run=MagicMock(return_value=None)),
+        patch("chalk.cli.run.build_configs", return_value=[preprocessed]),
+        patch("chalk.cli.run._run_without_ui"),
+    ):
+        run(config="{}", containerized=False, no_ui=True)
+
+    preprocess.assert_called_once_with(parsed)
+    assert RubricJudge.default_api_key == "from-preprocessor"
+
+
+@pytest.mark.usefixtures("in_chalk_image")
+@pytest.mark.parametrize(
+    ("rubric_judge_model", "expected"),
+    [("openai/gpt-5.5", "openai/gpt-5.5"), (None, "claude-sonnet-5")],
+)
+def test_the_judges_default_model_comes_from_the_config(
+    monkeypatch: pytest.MonkeyPatch, rubric_judge_model: str | None, expected: str
+):
+    from chalk.judges.rubric_judge import RubricJudge
+
+    monkeypatch.setattr(RubricJudge, "default_model", None)
+    parsed = EvaluationRunConfig(
+        run_id="r",
+        task_id="t",
+        model="claude-sonnet-5",
+        model_api_key="k",
+        rubric_judge_model=rubric_judge_model,
+    )
+    with (
+        patch("chalk.cli.run.parse_config", return_value=parsed),
+        patch("chalk.cli.run.load_task", return_value=MagicMock()),
+        patch(
+            "chalk.mcp_servers.http_mcp_server.run_server",
+            return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()),
+        ),
+        patch("chalk.cli.run.anyio", run=MagicMock(return_value=None)),
+        patch("chalk.cli.run.build_configs", return_value=[parsed]),
+        patch("chalk.cli.run._run_without_ui"),
+    ):
+        run(config="{}", containerized=False, no_ui=True)
+
+    assert RubricJudge.default_model == expected
+
+
+def _run_on(runtime: Runtime, **kwargs: Any) -> list[EvaluationRunConfig]:
+    parsed = EvaluationRunConfig(run_id="r", task_id="t", model="m", model_api_key="k")
+    with (
+        patch("chalk.firecracker.preflight.validate_firecracker_runtime"),
+        patch("chalk.cli.run.require_environment"),
+        patch("chalk.cli.run.require_runtime"),
+        patch("chalk.cli.run.require_builder"),
+        patch("chalk.cli.run.parse_config", return_value=parsed),
+        patch("chalk.cli.run.load_task", return_value=MagicMock()),
+        patch("chalk.cli.run.container_run_args", return_value=[]),
+        patch("chalk.modal_runtime.modal_problems", return_value=[]),
+        patch("chalk.cli.run._run_without_ui") as run_without_ui,
+    ):
+        run(config="{}", runtime=runtime, no_ui=True, **kwargs)
+    return run_without_ui.call_args.args[0]
+
+
+def test_websocket_port_sets_the_first_runs_port():
+    with patch("chalk.cli.run.ports_in_use", return_value=[]):
+        configs = _run_on("modal", n_parallel=2, websocket_port=9100)
+
+    assert [c.websocket_config.port for c in configs] == [9100, 9101]
+
+
+@pytest.mark.parametrize("runtime", ["docker", "firecracker", "modal"])
+def test_a_taken_port_stops_the_run_before_the_build(
+    runtime: Runtime, capsys: pytest.CaptureFixture[str]
+):
+    """Separate `chalk run` commands all start at the default port."""
+    import socket
+
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        port = taken.getsockname()[1]
+        with pytest.raises(typer.Abort):
+            _run_on(runtime, n_parallel=2, websocket_port=port - 1)
+
+    err = capsys.readouterr().err
+    assert str(port) in err and "--websocket-port" in err
+
+
+class TestSanitizePathsTiming:
+    """sanitize_paths_and_reexec() must only run in the process that hosts the
+    untrusted agent, not in the host process that merely orchestrates a
+    containerized run (where stripping non-root PATH entries can hide the
+    container runtime)."""
+
+    def _run(self, *, containerized: bool) -> MagicMock:
+        return self._run_recording(
+            "sanitize_paths_and_reexec", containerized=containerized
+        )
+
+    def _run_recording(self, target: str, *, containerized: bool) -> MagicMock:
+        run_config = EvaluationRunConfig(
+            run_id="test",
+            task_id="example-task",
+            model="vertex_ai/gemini",
+            model_api_key=None,
+            mcp_server_config=HttpMcpServerConfig(),
+        )
+        with (
+            patch("chalk.cli.run.sanitize_paths_and_reexec") as mock_sanitize,
+            patch("chalk.cli.run.harden_filesystem") as mock_harden,
+            patch("chalk.cli.run.parse_config", return_value=run_config),
+            patch(
+                "chalk.cli.run.apply_run_config_preprocessors",
+                return_value=run_config,
+            ),
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch(
+                "chalk.mcp_servers.http_mcp_server.run_server",
+                return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()),
+            ),
+            patch("chalk.cli.run.anyio", run=MagicMock(return_value=None)),
+            patch("chalk.cli.run.build_configs", return_value=[run_config]),
+            patch("chalk.cli.run._run_without_ui"),
+        ):
+            run(config="{}", containerized=containerized, no_ui=True, runtime="podman")
+        return {
+            "sanitize_paths_and_reexec": mock_sanitize,
+            "harden_filesystem": mock_harden,
+        }[target]
+
+    def test_not_called_on_host_orchestration_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("CHALK_CONTAINERIZED", raising=False)
+        mock_sanitize = self._run(containerized=True)
+        mock_sanitize.assert_not_called()
+
+    def test_called_on_uncontainerized_path(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CHALK_CONTAINERIZED", "1")
+        mock_sanitize = self._run(containerized=False)
+        mock_sanitize.assert_called_once()
+
+    def test_called_inside_container(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CHALK_CONTAINERIZED", "1")
+        mock_sanitize = self._run(containerized=True)
+        mock_sanitize.assert_called_once()
+
+    def test_the_filesystem_is_hardened_on_the_same_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The mounts a runtime leaves world-writable are the container's, so
+        they are closed where the untrusted agent is hosted and nowhere else."""
+        monkeypatch.setenv("CHALK_CONTAINERIZED", "1")
+        assert self._run_recording("harden_filesystem", containerized=True).called
+
+    def test_the_filesystem_is_not_hardened_on_the_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("CHALK_CONTAINERIZED", raising=False)
+        mock_harden = self._run_recording("harden_filesystem", containerized=True)
+        mock_harden.assert_not_called()
+
+
+class TestSanitizeLdPreloadSpaceSeparation:
+    """glibc splits LD_PRELOAD on spaces as well as colons; the sanitizer must too."""
+
+    def _sanitize(self, monkeypatch: pytest.MonkeyPatch, preload: str) -> str:
+        monkeypatch.setenv("CHALK_CONTAINERIZED", "1")
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setenv("LD_LIBRARY_PATH", "")
+        monkeypatch.setenv("LD_AUDIT", "")
+        monkeypatch.setenv("LD_PRELOAD", preload)
+        sanitize_paths()
+        return os.environ["LD_PRELOAD"]
+
+    def test_strips_space_separated_unsafe_entry(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        assert self._sanitize(monkeypatch, f"/usr/bin {tmp_path}") == "/usr/bin"
+
+    def test_keeps_space_separated_safe_entries(self, monkeypatch: pytest.MonkeyPatch):
+        result = self._sanitize(monkeypatch, "/usr/bin /bin")
+        assert result.split(os.pathsep) == ["/usr/bin", "/bin"]
+
+
+class TestSanitizePathsCiSkip:
+    """The ``CI`` skip protects a local test runner's PATH, but must never apply
+    inside a container: an eval run that happens to set CI must still have the
+    student-writable venv stripped from the (root) server's PATH."""
+
+    def _path_with_student_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> str:
+        """Set PATH to a non-root (student-writable) dir followed by a root dir,
+        and return the student dir. monkeypatch restores PATH on teardown, so the
+        in-place mutation sanitize_paths() makes does not leak to other tests."""
+        student_dir = tmp_path / "venv" / "bin"
+        student_dir.mkdir(parents=True)
+        monkeypatch.setenv("PATH", f"{student_dir}{os.pathsep}/usr/bin")
+        return str(student_dir)
+
+    def test_skips_in_ci_outside_a_container(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        monkeypatch.setenv("CI", "1")
+        monkeypatch.delenv("CHALK_CONTAINERIZED", raising=False)
+        student_dir = self._path_with_student_dir(monkeypatch, tmp_path)
+
+        sanitize_paths()
+
+        assert student_dir in os.environ["PATH"], "skip should leave PATH untouched"
+
+    def test_runs_in_ci_inside_a_container(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        monkeypatch.setenv("CI", "1")
+        monkeypatch.setenv("CHALK_CONTAINERIZED", "1")
+        student_dir = self._path_with_student_dir(monkeypatch, tmp_path)
+
+        sanitize_paths()
+
+        assert student_dir not in os.environ["PATH"], (
+            "the student-writable entry must be stripped even under CI in a container"
+        )
+        assert "/usr/bin" in os.environ["PATH"]
+
+    def test_logs_removals_at_debug(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        from loguru import logger
+
+        monkeypatch.setenv("CHALK_CONTAINERIZED", "1")
+        self._path_with_student_dir(monkeypatch, tmp_path)
+        levels: list[str] = []
+        sink = logger.add(
+            lambda m: levels.append(m.record["level"].name),
+            filter=lambda r: "Sanitized" in r["message"],
+        )
+        try:
+            sanitize_paths()
+        finally:
+            logger.remove(sink)
+
+        assert levels and set(levels) == {"DEBUG"}
+
+
+@patch("chalk.cli.run.run_containerized")
+@patch("chalk.cli.run.clean_up_old_containers")
+@patch("chalk.cli.run.build_container")
+def test_keep_containers_message_uses_the_actual_runtime(
+    _mock_build: MagicMock,
+    _mock_cleanup: MagicMock,
+    _mock_run: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+):
+    _run_without_ui(
+        [MagicMock(run_id="r", transcript_file=None)],
+        "docker:gvisor",
+        False,
+        ".",
+        keep_containers=True,
+    )
+
+    assert "docker cp chalk_run_r:/workdir/ ./out/" in capsys.readouterr().out
+
+
+@pytest.mark.usefixtures("in_chalk_image")
+class TestChownOutputsAfterRun:
+    def _run_uncontainerized(self, anyio_mock: MagicMock, chown: MagicMock) -> None:
+        run_config = EvaluationRunConfig(
+            run_id="r", task_id="t", model="m", model_api_key="k"
+        )
+        with (
+            patch("chalk.cli.run.chown_outputs", chown),
+            patch("chalk.cli.run.parse_config", return_value=run_config),
+            patch(
+                "chalk.cli.run.apply_run_config_preprocessors",
+                return_value=run_config,
+            ),
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch(
+                "chalk.mcp_servers.http_mcp_server.run_server",
+                return_value=MagicMock(
+                    __enter__=MagicMock(), __exit__=MagicMock(return_value=False)
+                ),
+            ),
+            patch("chalk.cli.run.anyio", anyio_mock),
+        ):
+            run(config="{}", containerized=False)
+
+    def test_outputs_are_chowned_after_the_run(self):
+        chown = MagicMock()
+
+        self._run_uncontainerized(MagicMock(run=MagicMock(return_value=None)), chown)
+
+        chown.assert_called_once()
+
+    def test_outputs_are_chowned_when_the_run_raises(self):
+        anyio_mock = MagicMock()
+        anyio_mock.run.side_effect = RuntimeError("boom")
+
+        chown = MagicMock()
+
+        with pytest.raises(RuntimeError):
+            self._run_uncontainerized(anyio_mock, chown)
+
+        chown.assert_called_once()
+
+
+def test_the_runtime_defaults_to_the_os_vm():
+    """No default in the signature: it is resolved from the platform and the
+    task's hardware (see `default_runtime`)."""
+    import inspect
+
+    assert inspect.signature(run).parameters["runtime"].default is None
+
+
+class TestMissingRuntime:
+    @pytest.mark.parametrize(
+        ("runtime", "message"),
+        [
+            ("docker", "docker not found. Install it or pass --runtime podman."),
+            ("podman", "podman not found. Install it or pass --runtime docker."),
+            (
+                "docker:gvisor",
+                "docker not found. Install it or pass --runtime podman.",
+            ),
+        ],
+    )
+    def test_exits_with_one_line_before_doing_anything(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        runtime: str,
+        message: str,
+    ):
+        monkeypatch.delenv("CHALK_CONTAINERIZED", raising=False)
+        with (
+            patch("chalk.build.which", return_value=None),
+            patch("chalk.cli.run.parse_config") as parse,
+            pytest.raises(typer.Exit) as exc_info,
+        ):
+            run(config="{}", runtime=runtime)  # pyright: ignore[reportArgumentType]
+
+        assert exc_info.value.exit_code == 1
+        assert capsys.readouterr().err.strip() == message
+        parse.assert_not_called()
+
+    def test_not_checked_without_containerization(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("CHALK_CONTAINERIZED", "1")
+        with (
+            patch("chalk.build.which", return_value=None) as which,
+            patch("chalk.cli.run.parse_config", side_effect=RuntimeError("parsed")),
+            pytest.raises(RuntimeError, match="parsed"),
+        ):
+            run(config="{}", containerized=False)
+
+        which.assert_not_called()
+
+    def test_not_checked_inside_the_container(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CHALK_CONTAINERIZED", "1")
+        with (
+            patch("chalk.build.which", return_value=None) as which,
+            patch("chalk.cli.run.parse_config", side_effect=RuntimeError("parsed")),
+            pytest.raises(RuntimeError, match="parsed"),
+        ):
+            run(config="{}")
+
+        which.assert_not_called()
+
+
+class TestMissingBuildx:
+    def test_exits_with_one_line_before_doing_anything(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ):
+        monkeypatch.delenv("CHALK_CONTAINERIZED", raising=False)
+        with (
+            patch("chalk.build._buildx_available", return_value=False),
+            patch("chalk.cli.run.parse_config") as parse,
+            pytest.raises(typer.Exit) as exc_info,
+        ):
+            run(config="{}", runtime="docker")
+
+        assert exc_info.value.exit_code == 1
+        assert "docker buildx not found" in capsys.readouterr().err
+        parse.assert_not_called()
+
+    def test_not_needed_in_dev_mode(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("CHALK_CONTAINERIZED", raising=False)
+        with (
+            patch("chalk.build._buildx_available", return_value=False) as buildx,
+            patch("chalk.cli.run.parse_config", side_effect=RuntimeError("parsed")),
+            pytest.raises(RuntimeError, match="parsed"),
+        ):
+            run(config="{}", runtime="docker", dev=True)
+
+        buildx.assert_not_called()
+
+
+class TestExitCode:
+    """A host-side run exits non-zero when a run ends in an error event; the backend's in-pod run and failed tasks exit 0."""
+
+    def _run_uncontainerized(
+        self, anyio_result: object, *, exit_on_error: bool = True
+    ) -> None:
+        run_config = EvaluationRunConfig(
+            run_id="r", task_id="t", model="m", model_api_key="k"
+        )
+        anyio_mock = MagicMock()
+        anyio_mock.run.return_value = anyio_result
+        env = {"CHALK_CONTAINERIZED": "1"}
+        if exit_on_error:
+            env[EXIT_ON_RUN_ERROR_ENV_VAR] = "1"
+        with (
+            patch.dict(os.environ, env),
+            patch("chalk.cli.run.parse_config", return_value=run_config),
+            patch(
+                "chalk.cli.run.apply_run_config_preprocessors",
+                return_value=run_config,
+            ),
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch(
+                "chalk.mcp_servers.http_mcp_server.run_server",
+                return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()),
+            ),
+            patch("chalk.cli.run.anyio", anyio_mock),
+        ):
+            run(config="{}", containerized=False)
+
+    def test_exits_1_when_the_run_ended_in_an_error(self):
+        error = ErrorEvent(exception_type="TurnLimitReachedError", message="x")
+
+        with pytest.raises(typer.Exit) as exc_info:
+            self._run_uncontainerized(error)
+
+        assert exc_info.value.exit_code == 1
+
+    def test_exits_130_when_the_run_was_interrupted(self):
+        error = ErrorEvent(exception_type="KeyboardInterrupt", message="")
+
+        with pytest.raises(typer.Exit) as exc_info:
+            self._run_uncontainerized(error)
+
+        assert exc_info.value.exit_code == 130
+
+    def test_exits_0_when_the_run_did_not_error(self):
+        self._run_uncontainerized(None)
+
+    def test_backend_invocation_exits_0_on_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv(EXIT_ON_RUN_ERROR_ENV_VAR, raising=False)
+        error = ErrorEvent(exception_type="TurnLimitReachedError", message="x")
+
+        self._run_uncontainerized(error, exit_on_error=False)
+
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_containerized_exits_non_zero_when_any_run_fails(
+        self,
+        _mock_build: MagicMock,
+        _mock_cleanup: MagicMock,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        configs: list[EvaluationRunConfig] = [
+            MagicMock(run_id="r-0", transcript_file=None),
+            MagicMock(run_id="r-1", transcript_file=None),
+        ]
+        ran: list[str] = []
+
+        def fake_run_containerized(config: MagicMock, **_: object) -> None:
+            ran.append(config.run_id)
+            if config.run_id == "r-0":
+                raise subprocess.CalledProcessError(1, ["podman", "run"])
+
+        with (
+            patch("chalk.cli.run.run_containerized", fake_run_containerized),
+            pytest.raises(typer.Exit) as exc_info,
+        ):
+            _run_without_ui(configs, "podman", False, ".", keep_containers=False)
+
+        assert exc_info.value.exit_code == 1
+        assert sorted(ran) == ["r-0", "r-1"]
+        assert "chalk_run_r-0" in capsys.readouterr().err
+
+    @patch("chalk.cli.run.run_containerized")
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_containerized_exits_0_when_all_runs_succeed(
+        self, _mock_build: MagicMock, _mock_cleanup: MagicMock, _mock_run: MagicMock
+    ):
+        _run_without_ui(
+            [
+                MagicMock(run_id="r-0", transcript_file=None),
+                MagicMock(run_id="r-1", transcript_file=None),
+            ],
+            "podman",
+            False,
+            ".",
+            keep_containers=False,
+        )
+
+    def test_tui_exits_1_when_a_run_failed(self):
+        run_config = EvaluationRunConfig(
+            run_id="r", task_id="t", model="m", model_api_key="k"
+        )
+        app = MagicMock(run_failed=True)
+        with (
+            patch("chalk.cli.run.parse_config", return_value=run_config),
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch(
+                "chalk.cli.run.apply_run_config_preprocessors",
+                return_value=run_config,
+            ),
+            patch("chalk.terminal.app.ChalkApp", return_value=app),
+            pytest.raises(typer.Exit) as exc_info,
+        ):
+            run(config="{}")
+
+        assert exc_info.value.exit_code == 1
+
+
+class TestHostOutputPaths:
+    """Containerized runs print /out paths from inside the container; the host prints its own."""
+
+    def _config(self, run_id: str = "r") -> EvaluationRunConfig:
+        return EvaluationRunConfig(
+            run_id=run_id,
+            task_id="t",
+            model="m",
+            model_api_key="k",
+            transcript_file="out/transcript.json",
+        )
+
+    @staticmethod
+    def _write_outputs(config: EvaluationRunConfig, **_: object) -> None:
+        out = Path("out")
+        (out / "transcript.json").write_text("{}")
+        (out / f"{config.run_id}_artifacts").mkdir()
+
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_prints_host_paths_after_a_run(
+        self,
+        _mock_build: MagicMock,
+        _mock_cleanup: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "out").mkdir()
+        with patch("chalk.cli.run.run_containerized", self._write_outputs):
+            _run_without_ui([self._config()], "docker", False, ".", False)
+
+        out = capsys.readouterr().out
+        assert f"Transcript: {tmp_path / 'out' / 'transcript.json'}" in out
+        assert f"Artifacts:  {tmp_path / 'out' / 'r_artifacts'}" in out
+
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_prints_host_paths_when_the_run_fails(
+        self,
+        _mock_build: MagicMock,
+        _mock_cleanup: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "out").mkdir()
+
+        def fail(config: EvaluationRunConfig, **_: object) -> None:
+            self._write_outputs(config)
+            raise subprocess.CalledProcessError(1, ["docker", "run"])
+
+        with (
+            patch("chalk.cli.run.run_containerized", fail),
+            pytest.raises(typer.Exit),
+        ):
+            _run_without_ui([self._config()], "docker", False, ".", False)
+
+        assert "Transcript: " in capsys.readouterr().out
+
+    @patch("chalk.cli.run.run_containerized")
+    @patch("chalk.cli.run.clean_up_old_containers")
+    @patch("chalk.cli.run.build_container")
+    def test_prints_nothing_for_missing_outputs(
+        self,
+        _mock_build: MagicMock,
+        _mock_cleanup: MagicMock,
+        _mock_run: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        monkeypatch.chdir(tmp_path)
+        _run_without_ui([self._config()], "docker", False, ".", False)
+
+        out = capsys.readouterr().out
+        assert "Transcript: " not in out
+        assert "Artifacts: " not in out
+
+    def test_prints_host_paths_after_the_tui_exits(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        monkeypatch.delenv("CHALK_CONTAINERIZED", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "out").mkdir()
+        run_config = self._config()
+        app = MagicMock(run_failed=False)
+        app.run.side_effect = lambda: self._write_outputs(run_config)
+        with (
+            patch("chalk.cli.run.parse_config", return_value=run_config),
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch(
+                "chalk.cli.run.apply_run_config_preprocessors",
+                return_value=run_config,
+            ),
+            patch("chalk.cli.run.require_environment"),
+            patch("chalk.terminal.app.ChalkApp", return_value=app),
+        ):
+            run(config="{}")
+
+        assert (
+            f"Transcript: {tmp_path / 'out' / 'transcript.json'}"
+            in capsys.readouterr().out
+        )
+
+
+class TestAgentCheck:
+    """On the host, the agent is checked before the image is built."""
+
+    def _launch(self, tmp_path: Path, agent: str, manifest_agents: list[str] | None):
+        if manifest_agents is not None:
+            (tmp_path / ".manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chalk_version": "3.0.0",
+                        "templates": [],
+                        "agents": manifest_agents,
+                    }
+                )
+            )
+        config = EvaluationRunConfig(
+            run_id="r", task_id="t", model="m", model_api_key="k"
+        ).model_dump_json()
+        with (
+            patch("chalk.cli.run.require_environment"),
+            patch("chalk.cli.run.require_runtime"),
+            patch("chalk.cli.run.require_builder"),
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch("chalk.cli.run.container_run_args", return_value=[]),
+            patch("chalk.cli.run._run_without_ui") as run_without_ui,
+        ):
+            run(
+                config=config,
+                agent=agent,
+                runtime="docker",
+                build_context=str(tmp_path),
+                no_ui=True,
+            )
+        return run_without_ui
+
+    def test_an_unknown_agent_stops_the_run(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        with pytest.raises(typer.Abort):
+            self._launch(tmp_path, "nope", manifest_agents=["codex"])
+
+        err = capsys.readouterr().err
+        assert "'nope'" in err and "chalk agents list" in err
+
+    @pytest.mark.parametrize("manifest_agents", [[], ["agy"], None])
+    def test_a_cli_agent_missing_from_the_manifest_stops_the_run(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        manifest_agents: list[str] | None,
+    ):
+        with pytest.raises(typer.Abort):
+            self._launch(tmp_path, "codex", manifest_agents)
+
+        assert "chalk agents add codex" in capsys.readouterr().err
+
+    def test_a_cli_agent_in_the_manifest_runs(self, tmp_path: Path):
+        run_without_ui = self._launch(tmp_path, "codex", manifest_agents=["codex"])
+
+        assert run_without_ui.call_args.args[0][0].agent == "codex"
+
+    @pytest.mark.parametrize("agent", ["builtin", "external"])
+    def test_builtin_agents_need_no_manifest(self, tmp_path: Path, agent: str):
+        run_without_ui = self._launch(tmp_path, agent, manifest_agents=None)
+
+        assert run_without_ui.call_args.args[0][0].agent == agent
+
+
+class TestPluginRefusesTheLaunch:
+    def _launch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CHALK_CONTAINERIZED", raising=False)
+        run_config = EvaluationRunConfig(
+            run_id="r", task_id="t", model="m", model_api_key="k"
+        )
+        with (
+            patch("chalk.cli.run.require_environment"),
+            patch("chalk.cli.run.require_runtime"),
+            patch("chalk.cli.run.require_builder"),
+            patch("chalk.cli.run.parse_config", return_value=run_config),
+            patch("chalk.cli.run.load_task", return_value=MagicMock()),
+            patch("chalk.cli.run._run_without_ui", side_effect=RuntimeError("ran")),
+        ):
+            run(config="{}", runtime="docker", no_ui=True)
+
+    def test_the_plugin_message_is_shown_and_nothing_runs(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ):
+        def refuse(task: object, runtime: str) -> list[str]:
+            del task, runtime
+            raise RuntimeError("runsc lacks -tpuproxy")
+
+        register_hardware_plugins(monkeypatch, container_run_args={"a": refuse})
+
+        with pytest.raises(typer.Abort):
+            self._launch(monkeypatch)
+
+        assert "runsc lacks -tpuproxy" in capsys.readouterr().err
+
+    def test_without_a_refusal_the_run_goes_ahead(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        register_hardware_plugins(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="ran"):
+            self._launch(monkeypatch)
+
+
+class TestRunFromSource:
+    """With a SOURCE, run hands off to the environment's own chalk."""
+
+    @pytest.fixture
+    def env(self, tmp_path: Path) -> Path:
+        path = tmp_path / "envs" / "my-env"
+        path.mkdir(parents=True)
+        (path / "pyproject.toml").write_text("")
+        return path
+
+    @pytest.fixture(autouse=True)
+    def cwd(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        path = tmp_path / "work"
+        path.mkdir()
+        monkeypatch.chdir(path)
+        return path
+
+    def _run(
+        self, env: Path, task_ids: tuple[str, ...] = ("only-task",), **kwargs: Any
+    ) -> SimpleNamespace:
+        def only_task(_env: Path) -> str:
+            if len(task_ids) != 1:
+                raise SourceError("several")
+            return task_ids[0]
+
+        with (
+            patch("chalk.cli.run.os.execvpe") as execvpe,
+            patch("chalk.cli.run.run_pre_build") as pre_build,
+            patch("chalk.cli.run.single_task_id", side_effect=only_task) as single_task,
+        ):
+            kwargs.setdefault("model", "openai/gpt-5.5")
+            run(source=str(env), **kwargs)
+        argv: list[str] = execvpe.call_args.args[1]
+        config_index = argv.index("--config") + 1
+        return SimpleNamespace(
+            file=execvpe.call_args.args[0],
+            argv=argv,
+            env=execvpe.call_args.args[2],
+            config=json.loads(argv[config_index]),
+            flags=argv[config_index + 1 :],
+            pre_build=pre_build,
+            single_task=single_task,
+        )
+
+    def test_runs_the_environments_chalk_in_it(self, env: Path):
+        result = self._run(env, task="t")
+
+        assert result.file == "uv"
+        assert result.argv[:8] == [
+            "uv",
+            "run",
+            "--frozen",
+            "--directory",
+            str(env.resolve()),
+            "chalk",
+            "run",
+            "--config",
+        ]
+        assert result.config["task_id"] == "t"
+        assert result.config["model"] == "openai/gpt-5.5"
+        assert result.flags == []
+
+    def test_ignores_the_callers_venv(self, env: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("VIRTUAL_ENV", "/somewhere/.venv")
+
+        result = self._run(env, task="t")
+
+        assert "VIRTUAL_ENV" not in result.env
+
+    def test_builds_a_per_environment_image(self, env: Path):
+        result = self._run(env, task="t")
+
+        assert result.env["CHALK_IMAGE"] == image_name_for(env.resolve(), "my-env")
+        assert result.env["PATH"] == os.environ["PATH"]
+
+    def test_the_transcript_stays_in_the_working_directory(self, env: Path, cwd: Path):
+        result = self._run(env, task="t")
+
+        assert result.config["transcript_file"] == str(cwd / "out" / "transcript.json")
+
+    def test_a_relative_transcript_file_is_made_absolute(self, env: Path, cwd: Path):
+        result = self._run(env, task="t", transcript_file="runs/t.json")
+
+        assert result.config["transcript_file"] == str(cwd / "runs" / "t.json")
+
+    def test_the_agent_is_passed_on_in_the_config(self, env: Path):
+        result = self._run(env, task="t", agent="codex")
+
+        assert result.config["agent"] == "codex"
+        assert result.flags == []
+
+    def test_a_config_file_is_read_from_the_working_directory(
+        self, env: Path, cwd: Path
+    ):
+        (cwd / "config.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "r",
+                    "task_id": "from-file",
+                    "model": "m",
+                    "transcript_file": "here/t.json",
+                }
+            )
+        )
+
+        result = self._run(env, config="config.json", model=None)
+
+        assert result.config["task_id"] == "from-file"
+        assert result.config["transcript_file"] == str(cwd / "here" / "t.json")
+        result.single_task.assert_not_called()
+
+    def test_an_unreadable_config_aborts(
+        self, env: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        with pytest.raises(typer.Abort):
+            self._run(env, config="missing.json")
+
+        assert "missing.json" in capsys.readouterr().err
+
+    def test_the_only_task_is_picked(self, env: Path):
+        result = self._run(env)
+
+        assert result.config["task_id"] == "only-task"
+        result.single_task.assert_called_once_with(env.resolve())
+
+    def test_task_skips_the_lookup(self, env: Path):
+        result = self._run(env, task="t")
+
+        result.single_task.assert_not_called()
+
+    def test_several_tasks_abort(self, env: Path, capsys: pytest.CaptureFixture[str]):
+        with pytest.raises(typer.Abort):
+            self._run(env, task_ids=("a", "b"))
+
+        assert "several" in capsys.readouterr().err
+
+    def test_runs_setup_data_before_the_build(self, env: Path):
+        (env / "setup_data.py").write_text("")
+
+        result = self._run(env, task="t")
+
+        result.pre_build.assert_called_once_with(env.resolve(), ["setup_data.py"])
+
+    def test_runs_the_given_pre_build_scripts(self, env: Path):
+        (env / "a.py").write_text("")
+
+        result = self._run(env, task="t", pre_build=["a.py"])
+
+        result.pre_build.assert_called_once_with(env.resolve(), ["a.py"])
+
+    @pytest.mark.parametrize("flags", [{"no_pre_build": True}, {"dev": True}])
+    def test_no_pre_build_scripts(self, env: Path, flags: dict[str, Any]):
+        (env / "setup_data.py").write_text("")
+
+        result = self._run(env, task="t", **flags)
+
+        result.pre_build.assert_called_once_with(env.resolve(), [])
+
+    def test_pre_build_and_no_pre_build_conflict(
+        self, env: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        with pytest.raises(typer.Abort):
+            self._run(env, task="t", pre_build=["a.py"], no_pre_build=True)
+
+        assert "--no-pre-build" in capsys.readouterr().err
+
+    def test_forwards_the_other_options_with_absolute_paths(self, env: Path, cwd: Path):
+        (cwd / "data").mkdir()
+        (cwd / "mounts.txt").write_text("# comment\ndata:/b:ro\n")
+
+        result = self._run(
+            env,
+            task="t",
+            containerized=False,
+            runtime="podman",
+            build_context="sub",
+            n_parallel=3,
+            websocket_port=8100,
+            dev=True,
+            mount=["data:/a", "@mounts.txt"],
+            no_ui=True,
+            keep_containers=True,
+            cache_from=["type=local,src=c"],
+            cache_to=["type=local,dest=c"],
+            build_secret=["uv_env=secret.env"],
+            proxy="http://proxy",
+            no_proxy=True,
+            prepare_only=True,
+            model_api_key_file="key.txt",
+        )
+
+        assert result.flags == [
+            "--no-containerized",
+            "--runtime",
+            "podman",
+            "--build-context",
+            "sub",
+            "--n-parallel",
+            "3",
+            "--websocket-port",
+            "8100",
+            "--dev",
+            "--mount",
+            f"{cwd / 'data'}:/a",
+            "--mount",
+            f"{cwd / 'data'}:/b:ro",
+            "--no-ui",
+            "--keep-containers",
+            "--cache-from",
+            "type=local,src=c",
+            "--cache-to",
+            "type=local,dest=c",
+            "--build-secret",
+            f"uv_env={cwd / 'secret.env'}",
+            "--proxy",
+            "http://proxy",
+            "--no-proxy",
+            "--prepare-only",
+            "--model-api-key-file",
+            str(cwd / "key.txt"),
+        ]
+        assert "model_api_key" not in result.config
+
+    def test_a_bad_source_aborts(self, capsys: pytest.CaptureFixture[str]):
+        with pytest.raises(typer.Abort):
+            run(source="no-such-env", task="t", model="m")
+
+        assert "no-such-env" in capsys.readouterr().err
+
+    def test_pre_build_needs_a_source(self, capsys: pytest.CaptureFixture[str]):
+        with pytest.raises(typer.Abort):
+            run(task="t", model="m", pre_build=["a.py"])
+
+        assert "SOURCE" in capsys.readouterr().err

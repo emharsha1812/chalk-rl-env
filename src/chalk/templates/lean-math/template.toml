@@ -1,0 +1,2 @@
+description = "Experimental Lean proof task adapted from FineEnvs/openai-math."
+requires = ["default"]

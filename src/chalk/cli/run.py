@@ -1,0 +1,891 @@
+import glob
+import json
+import os
+import subprocess
+import uuid
+from collections.abc import Sequence
+from importlib.metadata import entry_points
+from pathlib import Path
+from typing import Annotated, Any, Never, get_args
+
+import anyio
+import typer
+from loguru import logger
+from pydantic import ValidationError
+
+from chalk import Runtime, staged_mounts
+from chalk.build import build_container, require_builder, require_runtime
+from chalk.container import is_containerized
+from chalk.env_source import (
+    SourceError,
+    environment_dir,
+    image_name_for,
+    pre_build_scripts,
+    run_pre_build,
+    single_task_id,
+    uv_env,
+)
+from chalk.forwarded_env import EXIT_ON_RUN_ERROR_ENV_VAR
+from chalk.hardware import container_run_args, default_runtime
+from chalk.judges import RubricJudge
+from chalk.load_tasks import load_task, require_environment
+from chalk.providers import PROXY_PLACEHOLDER_KEY
+from chalk.run_config_preprocessors import apply_run_config_preprocessors
+from chalk.run_helpers import (
+    build_configs,
+    chown_outputs,
+    clean_up_old_containers,
+    copy_hint,
+    harden_filesystem,
+    key_env_var,
+    parse_config,
+    ports_in_use,
+    run_containerized,
+    sanitize_paths_and_reexec,
+    stop_containers,
+    validate_gvisor_runtime,
+)
+from chalk.runtime import IMAGE_ENV_VAR
+from chalk.schemas.evaluation_run_config import EvaluationRunConfig
+
+PROXY_ENTRY_POINT_GROUP = "chalk.default_proxy_url"
+
+
+def default_proxy_url() -> str | None:
+    """The proxy an installed package registers, first by entry point name."""
+    for ep in sorted(
+        entry_points(group=PROXY_ENTRY_POINT_GROUP), key=lambda ep: ep.name
+    ):
+        try:
+            return ep.load()
+        except Exception as e:  # noqa: BLE001 - a broken plugin must not break chalk
+            logger.warning("Ignoring default proxy from {!r}: {}", ep.name, e)
+    return None
+
+
+def _read_config(config: str) -> Any:
+    """The data in a JSON config or config file, or None if it has none."""
+    try:
+        return json.loads(config)
+    except ValueError:
+        try:
+            return json.loads(Path(config).read_text())
+        except (OSError, ValueError):
+            return None
+
+
+def _config_with_flags(
+    config: str | None, flags: dict[str, str | int | float | None]
+) -> str:
+    """``config`` with the set ``flags`` on top, or a new config from them."""
+    set_flags = {field: value for field, value in flags.items() if value is not None}
+    if config is None:
+        missing = [
+            f"--{field.removesuffix('_id')}"
+            for field in ("task_id", "model")
+            if field not in set_flags
+        ]
+        if missing:
+            _print_and_abort(f"Pass --config, or {' and '.join(missing)}.")
+        return json.dumps(
+            {
+                "run_id": uuid.uuid4().hex[:8],
+                "transcript_file": "out/transcript.json",
+                **set_flags,
+            }
+        )
+    data = _read_config(config)
+    if not set_flags or not isinstance(data, dict):
+        return config
+    return json.dumps({**data, **set_flags})
+
+
+def _key_env_vars(config: str) -> list[str]:
+    """The env vars a JSON config or config file reads its model and rubric
+    judge API keys from."""
+    data = _read_config(config)
+    try:
+        run_config = EvaluationRunConfig.model_validate(data)
+    except ValidationError:
+        return []
+    env_vars = [
+        key_env_var(run_config.model_api_key, run_config.model),
+        key_env_var(
+            run_config.rubric_judge_api_key, run_config.resolved_rubric_judge_model
+        ),
+    ]
+    return [env_var for env_var in env_vars if env_var]
+
+
+def _export_proxy(proxy_url: str) -> None:
+    """Route this process's model calls through ``proxy_url``, unless the environment already routes them."""
+    if "CHALK_PROXY_URL" in os.environ or "ANTHROPIC_BASE_URL" in os.environ:
+        return
+    os.environ["ANTHROPIC_BASE_URL"] = proxy_url
+    os.environ["CHALK_PROXY_URL"] = proxy_url
+
+
+def run(
+    source: Annotated[
+        str | None,
+        typer.Argument(
+            metavar="[SOURCE]",
+            help="Environment to run, instead of the current one: a folder, a GitHub URL "
+            + "(also of a folder: .../tree/<ref>/<path>), or "
+            + "git+<url>@<ref>#subdirectory=<path> (ref and subdirectory optional). "
+            + "Runs the chalk version the environment pins. "
+            + "--task can be omitted if the environment has only one task.",
+        ),
+    ] = None,
+    config: Annotated[
+        str | None,
+        typer.Option(
+            "--config",
+            "-c",
+            help="JSON-serialized EvaluationRunConfig, or a path to a file with one. "
+            + "Without it, --task and --model are required.",
+        ),
+    ] = None,
+    task: Annotated[
+        str | None,
+        typer.Option(help="Task ID. Overrides the config's task_id."),
+    ] = None,
+    agent: Annotated[
+        str | None,
+        typer.Option(
+            help="Agent that drives the run; see `chalk agents list`. Overrides the config's agent."
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(help="Model name. Overrides the config's model."),
+    ] = None,
+    model_api_key: Annotated[
+        str | None,
+        typer.Option(
+            help="Model API key, or a `$VAR` reference to one. Overrides the config's model_api_key."
+        ),
+    ] = None,
+    model_api_key_file: Annotated[
+        str | None,
+        typer.Option(hidden=True, help="File holding the model API key."),
+    ] = None,
+    reasoning_effort: Annotated[
+        str | None,
+        typer.Option(
+            help="`min`, `max`, or one of the model's own levels. Overrides the config's reasoning_effort."
+        ),
+    ] = None,
+    temperature: Annotated[
+        float | None,
+        typer.Option(help="Sampling temperature. Overrides the config's temperature."),
+    ] = None,
+    max_output_tokens: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Maximum tokens per model response, for the builtin agent.",
+        ),
+    ] = None,
+    transcript_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Where to save the transcript. Overrides the config's transcript_file. "
+            + "Default without --config: out/transcript.json."
+        ),
+    ] = None,
+    containerized: Annotated[
+        bool,
+        typer.Option(
+            help="Whether to execute the run inside a docker/podman container. "
+            + "--no-containerized only works inside a chalk container image."
+        ),
+    ] = True,
+    runtime: Annotated[
+        Runtime | None,
+        typer.Option(
+            metavar="NAME",
+            help=f"Container runtime: {', '.join(get_args(Runtime))}. Default: the"
+            + " OS's VM (`apple-container` on macOS, `firecracker` on Linux); docker for"
+            + " accelerator hardware and other platforms.",
+        ),
+    ] = None,
+    build_context: Annotated[
+        str, typer.Option(help="Path to the build context for the container.")
+    ] = ".",
+    n_parallel: Annotated[
+        int,
+        typer.Option(
+            "--n-parallel",
+            "-n",
+            metavar="N",
+            help="Number of parallel runs. Can only be >1 when running containerized.",
+        ),
+    ] = 1,
+    websocket_port: Annotated[
+        int | None,
+        typer.Option(
+            metavar="PORT",
+            help="Websocket port of the first run; parallel runs count up from it. "
+            + "Overrides the port in the run config. "
+            + "Give separate `chalk run` commands that run at the same time different ports.",
+        ),
+    ] = None,
+    dev: Annotated[
+        bool,
+        typer.Option(
+            help="Skip the image build and bind the environment's src/environment "
+            + "folder into the container, to iterate quickly on environment code. "
+            + "Can only be used when running containerized. "
+            + "Changed dependencies or env/scoring data still need a rebuild."
+        ),
+    ] = False,
+    mount: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--mount",
+            help="Bind-mount a host path into the container. "
+            + "Format: source:target[:ro]. "
+            + "Bind mounts are read-write by default; append :ro for read-only. "
+            + "Can be specified multiple times. "
+            + "Use @file.txt to read mount specs from a file (one per line; "
+            + "blank lines and lines starting with # are ignored). "
+            + "When running parallel containers, all containers share the same bind mounts. "
+            + "Can only be used when running containerized.",
+        ),
+    ] = None,
+    no_ui: Annotated[
+        bool,
+        typer.Option(
+            "--no-ui",
+            help="Disable the TUI and print output from all runs directly to the terminal.",
+        ),
+    ] = False,
+    keep_containers: Annotated[
+        bool,
+        typer.Option(
+            help="Keep containers after runs instead of removing them. "
+            + "They are named chalk_run_<id>, and existing containers with the "
+            + "same names get removed before the runs start. "
+            + "Copy data out of them with `<runtime> cp`.",
+        ),
+    ] = False,
+    cache_from: Annotated[
+        list[str] | None,
+        typer.Option(help="Cache source passed to the container runtime."),
+    ] = None,
+    cache_to: Annotated[
+        list[str] | None,
+        typer.Option(help="Cache destination passed to the container runtime."),
+    ] = None,
+    build_secret: Annotated[
+        list[str] | None,
+        typer.Option(
+            help="name=path of a file the Containerfile can mount as a build secret "
+            + "with type=secret and id=<name>. Repeatable."
+        ),
+    ] = None,
+    proxy: Annotated[
+        str | None,
+        typer.Option(
+            "--proxy",
+            help="Proxy URL for API calls. Sets ANTHROPIC_BASE_URL and CHALK_PROXY_URL for the run; with --no-containerized only if neither is set yet. Defaults to the one an installed plugin registers.",
+        ),
+    ] = None,
+    no_proxy: Annotated[
+        bool,
+        typer.Option(
+            "--no-proxy",
+            help="Disable the proxy.",
+        ),
+    ] = False,
+    prepare_only: Annotated[
+        bool,
+        typer.Option(
+            "--prepare-only",
+            help="Set up the env like a real run, including tools and the task "
+            + "pre-hook, then hold it open without running any steps, so you can "
+            + "exec in and inspect it. Readiness is signaled by a marker file in "
+            + "/tmp named chalk_prepared_ plus the run ID. Containerized, the env "
+            + "is held in its container (chalk_run_<id>); with --no-containerized "
+            + "the current process holds it. Cannot be combined with --n-parallel > 1.",
+        ),
+    ] = False,
+    pre_build: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--pre-build",
+            metavar="SCRIPT",
+            help="Script in a SOURCE environment to run with `uv run` before the image is "
+            + "built. Repeatable. Default: setup_data.py, if the environment has one.",
+        ),
+    ] = None,
+    no_pre_build: Annotated[
+        bool,
+        typer.Option(
+            "--no-pre-build",
+            help="Run no scripts before building a SOURCE environment.",
+        ),
+    ] = False,
+) -> None:
+    """Execute an evaluation run."""
+
+    from chalk.mcp_servers.http_mcp_server import run_server as run_mcp_server
+
+    if source is not None:
+        _run_from_source(
+            source,
+            config,
+            {
+                "task_id": task,
+                "agent": agent,
+                "model": model,
+                "model_api_key": model_api_key,
+                "reasoning_effort": reasoning_effort,
+                "temperature": temperature,
+                "max_output_tokens": max_output_tokens,
+                "transcript_file": transcript_file,
+            },
+            pre_build=pre_build,
+            no_pre_build=no_pre_build,
+            dev=dev,
+            options=_source_run_options(
+                containerized=containerized,
+                runtime=runtime,
+                build_context=build_context,
+                n_parallel=n_parallel,
+                websocket_port=websocket_port,
+                dev=dev,
+                mount=mount or [],
+                no_ui=no_ui,
+                keep_containers=keep_containers,
+                cache_from=cache_from or [],
+                cache_to=cache_to or [],
+                build_secret=build_secret or [],
+                proxy=proxy,
+                no_proxy=no_proxy,
+                prepare_only=prepare_only,
+                model_api_key_file=model_api_key_file,
+            ),
+        )
+        return
+
+    if pre_build or no_pre_build:
+        _print_and_abort("--pre-build and --no-pre-build only apply with a SOURCE.")
+
+    if n_parallel > 1 and not containerized:
+        _print_and_abort("Cannot run multiple runs without containerization.")
+
+    if prepare_only and n_parallel > 1:
+        _print_and_abort("Cannot use --prepare-only with --n-parallel > 1.")
+
+    if dev and not containerized:
+        _print_and_abort("Cannot use the `--dev` option without containerization.")
+
+    if model_api_key_file is not None:
+        model_api_key = Path(model_api_key_file).read_text()
+    config = _config_with_flags(
+        config,
+        {
+            "task_id": task,
+            "agent": agent,
+            "model": model,
+            "model_api_key": model_api_key,
+            "reasoning_effort": reasoning_effort,
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+            "transcript_file": transcript_file,
+        },
+    )
+
+    proxy_url = None if no_proxy else proxy or default_proxy_url()
+
+    if mount and not containerized:
+        _print_and_abort("Cannot use the `--mount` option without containerization.")
+
+    if mount:
+        mount = _expand_mount_file_references(mount)
+        _validate_mount_specs(mount)
+
+    if keep_containers and not containerized:
+        _print_and_abort(
+            "Cannot use the `--keep-containers` option without containerization."
+        )
+
+    if not containerized and not is_containerized():
+        _print_and_abort(
+            "--no-containerized only runs inside a chalk container image; "
+            + "drop the flag to run in a container."
+        )
+
+    if proxy_url:
+        for env_var in _key_env_vars(config):
+            if not os.environ.get(env_var):
+                os.environ[env_var] = PROXY_PLACEHOLDER_KEY
+
+    require_environment()
+    # An explicit runtime is checked before anything else; the default needs
+    # the task's hardware, so it is checked once that is known.
+    on_host = containerized and not is_containerized()
+    if on_host and runtime is not None:
+        require_runtime(runtime)
+        if not dev:
+            require_builder(runtime)
+
+    run_config = parse_config(config, prepare_only=prepare_only)
+    run_config = apply_run_config_preprocessors(run_config)
+    if websocket_port is not None:
+        run_config = run_config.model_copy(
+            update={
+                "websocket_config": run_config.websocket_config.model_copy(
+                    update={"port": websocket_port}
+                )
+            }
+        )
+
+    if runtime is None:
+        runtime = default_runtime(
+            load_task(run_config).required_hardware if on_host else None
+        )
+        if on_host:
+            logger.info(f"Runtime: {runtime} (default; pass --runtime to change)")
+            require_runtime(runtime)
+            if not dev:
+                require_builder(runtime)
+
+    if runtime == "docker:gvisor":
+        validate_gvisor_runtime()
+
+    if on_host:
+        _check_agent(run_config.resolved_agent, build_context)
+
+    if containerized and not is_containerized():
+        try:
+            _ = container_run_args(load_task(run_config), runtime)
+        except Exception as e:  # noqa: BLE001 - a plugin refuses the launch by raising
+            _print_and_abort(str(e))
+
+    if runtime == "apple-container" and containerized and not is_containerized():
+        from chalk.apple_container import validate_container_runtime
+
+        validate_container_runtime(load_task(run_config).required_hardware)
+    if runtime == "firecracker" and containerized and not is_containerized():
+        from chalk.firecracker.preflight import validate_firecracker_runtime
+
+        validate_firecracker_runtime(load_task(run_config).required_hardware, mount)
+    if runtime == "modal" and containerized and not is_containerized():
+        from chalk.modal_runtime import modal_problems
+
+        problems = modal_problems(
+            required_hardware=load_task(run_config).required_hardware,
+            mounts=mount,
+            dev=dev,
+            keep_containers=keep_containers,
+            prepare_only=prepare_only,
+            proxy_url=proxy_url,
+        )
+        if problems:
+            _print_and_abort("\n".join(problems))
+
+    if run_config.resolved_rubric_judge_model is not None:
+        RubricJudge.default_model = run_config.resolved_rubric_judge_model
+    if run_config.rubric_judge_api_key is not None:
+        RubricJudge.default_api_key = run_config.rubric_judge_api_key
+
+    # If we are already inside a container or should run uncontainerized, don't launch the TUI.
+    # Just execute the run and stream to websocket
+    if is_containerized() or containerized is False:
+        from chalk.subprocess import chdir_to_workdir
+
+        sanitize_paths_and_reexec()
+        harden_filesystem()
+        staged_mounts.copy_in()
+
+        chdir_to_workdir()
+
+        # The host already chose the proxy, so a plugin default must not undo --no-proxy.
+        if proxy_url and proxy:
+            _export_proxy(proxy_url)
+
+        loaded_task = load_task(run_config)
+
+        error = None
+        with run_mcp_server(run_config.mcp_server_config), staged_mounts.copied_back():
+            from chalk.run_helpers import hold_prepared_env, run_non_containerized
+
+            if prepare_only:
+                hold_prepared_env(run_config, loaded_task)
+            else:
+                try:
+                    error = anyio.run(run_non_containerized, run_config, loaded_task)
+                finally:
+                    chown_outputs(run_config)
+        # The backend's pods rely on exit 0; only the host's containers ask for a non-zero exit.
+        if error is not None and os.environ.get(EXIT_ON_RUN_ERROR_ENV_VAR):
+            raise typer.Exit(130 if error.exception_type == "KeyboardInterrupt" else 1)
+        return
+
+    run_configs = build_configs(run_config, n_parallel)
+    if runtime == "apple-container":
+        from chalk.apple_container import assign_host_ports
+
+        run_configs = assign_host_ports(run_configs)
+    elif not prepare_only:
+        if taken := ports_in_use([c.websocket_config.port for c in run_configs]):
+            _print_and_abort(
+                f"Port {', '.join(map(str, taken))} is in use, maybe by another `chalk run`. "
+                + "Pass --websocket-port to use other ports."
+            )
+
+    if n_parallel > 1 and mount:
+        writable_mounts = [m for m in mount if not m.endswith(":ro")]
+        if writable_mounts:
+            typer.secho(
+                f"Warning: {len(writable_mounts)} writable bind mount(s) will be shared across "
+                + f"{n_parallel} parallel containers. Consider using :ro suffix for read-only access.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+
+    # Run without UI - build container and run with stdout output.
+    # Prepare-only runs produce no event stream, so the TUI adds nothing.
+    if no_ui or prepare_only:
+        _run_without_ui(
+            run_configs,
+            runtime,
+            dev,
+            build_context,
+            keep_containers,
+            mounts=mount,
+            cache_from=cache_from,
+            cache_to=cache_to,
+            build_secrets=build_secret or (),
+            proxy_url=proxy_url,
+            prepare_only=prepare_only,
+        )
+        return
+
+    # Launch TUI
+    from chalk.terminal.app import ChalkApp
+
+    tui_app = ChalkApp(configs=run_configs)
+
+    tui_app.runtime = runtime
+    tui_app.dev = dev
+    tui_app.build_context = build_context
+    tui_app.build_secrets = build_secret or ()
+    tui_app.cache_from = cache_from
+    tui_app.cache_to = cache_to
+    tui_app.containerized = containerized
+    tui_app.keep_containers = keep_containers
+    tui_app.mounts = mount
+    tui_app.proxy_url = proxy_url
+
+    # Launch TUI - this blocks until user quits
+    tui_app.run()
+    _print_output_paths(run_configs)
+    if tui_app.run_failed:
+        raise typer.Exit(1)
+
+
+def _check_agent(agent: str, build_context: str) -> None:
+    """Abort unless ``agent`` exists and, for a CLI agent, the image gets built with it."""
+    from chalk.agents import cli_agent_types
+    from chalk.create_env import EnvManifest
+
+    if agent in ("builtin", "external"):
+        return
+    if agent not in cli_agent_types():
+        _print_and_abort(f"Unknown agent {agent!r}. See `chalk agents list`.")
+    manifest = Path(build_context) / ".manifest.json"
+    if (
+        not manifest.is_file()
+        or agent not in EnvManifest.model_validate_json(manifest.read_text()).agents
+    ):
+        _print_and_abort(
+            f"The image isn't built with the {agent} agent. "
+            + f"Add it with `chalk agents add {agent}`."
+        )
+
+
+def _run_from_source(
+    source: str,
+    config: str | None,
+    flags: dict[str, str | int | float | None],
+    *,
+    pre_build: list[str] | None,
+    no_pre_build: bool,
+    dev: bool,
+    options: list[str],
+) -> None:
+    """Prepare the environment ``source`` names and replace this process with its own `chalk run`."""
+    if pre_build and no_pre_build:
+        _print_and_abort("Pass --pre-build or --no-pre-build, not both.")
+    data = None if config is None else _read_config(config)
+    if config is not None and not isinstance(data, dict):
+        _print_and_abort(f"Could not read the config {config}.")
+    try:
+        path, name = environment_dir(source)
+        if flags["task_id"] is None and not (data or {}).get("task_id"):
+            flags["task_id"] = single_task_id(path)
+        scripts = [] if no_pre_build or dev else pre_build_scripts(path, pre_build)
+        run_pre_build(path, scripts)
+    except SourceError as e:
+        _print_and_abort(str(e))
+
+    run_config = json.loads(
+        _config_with_flags(None if data is None else json.dumps(data), flags)
+    )
+    # The environment's chalk runs in its folder, but outputs belong here.
+    if transcript := run_config.get("transcript_file"):
+        run_config["transcript_file"] = str(Path(transcript).absolute())
+    os.execvpe(
+        "uv",
+        [
+            "uv",
+            "run",
+            "--frozen",
+            "--directory",
+            str(path),
+            "chalk",
+            "run",
+            "--config",
+            json.dumps(run_config),
+            *options,
+        ],
+        {**uv_env(), IMAGE_ENV_VAR: image_name_for(path, name)},
+    )
+
+
+def _source_run_options(
+    *,
+    containerized: bool,
+    runtime: Runtime | None,
+    build_context: str,
+    n_parallel: int,
+    websocket_port: int | None,
+    dev: bool,
+    mount: list[str],
+    no_ui: bool,
+    keep_containers: bool,
+    cache_from: list[str],
+    cache_to: list[str],
+    build_secret: list[str],
+    proxy: str | None,
+    no_proxy: bool,
+    prepare_only: bool,
+    model_api_key_file: str | None,
+) -> list[str]:
+    """The `run` options to pass on, with host paths made absolute."""
+    options: list[str] = []
+    if not containerized:
+        options.append("--no-containerized")
+    if runtime is not None:
+        options += ["--runtime", runtime]
+    if build_context != ".":
+        options += ["--build-context", build_context]
+    if n_parallel != 1:
+        options += ["--n-parallel", str(n_parallel)]
+    if websocket_port is not None:
+        options += ["--websocket-port", str(websocket_port)]
+    if dev:
+        options.append("--dev")
+    for spec in _expand_mount_file_references(mount):
+        host, _, rest = spec.partition(":")
+        options += ["--mount", f"{Path(host).absolute()}:{rest}"]
+    if no_ui:
+        options.append("--no-ui")
+    if keep_containers:
+        options.append("--keep-containers")
+    for value in cache_from:
+        options += ["--cache-from", value]
+    for value in cache_to:
+        options += ["--cache-to", value]
+    for spec in build_secret:
+        secret, _, file = spec.partition("=")
+        options += ["--build-secret", f"{secret}={Path(file).absolute()}"]
+    if proxy is not None:
+        options += ["--proxy", proxy]
+    if no_proxy:
+        options.append("--no-proxy")
+    if prepare_only:
+        options.append("--prepare-only")
+    if model_api_key_file is not None:
+        options += ["--model-api-key-file", str(Path(model_api_key_file).absolute())]
+    return options
+
+
+def _run_without_ui(
+    run_configs: list[EvaluationRunConfig],
+    runtime: Runtime,
+    dev: bool,
+    build_context: str,
+    keep_containers: bool,
+    mounts: list[str] | None = None,
+    cache_from: list[str] | None = None,
+    cache_to: list[str] | None = None,
+    build_secrets: Sequence[str] = (),
+    proxy_url: str | None = None,
+    prepare_only: bool = False,
+) -> None:
+    """Run containerized evaluations without the TUI, outputting directly to stdout."""
+    from concurrent.futures import ThreadPoolExecutor
+    from functools import partial
+
+    # Build container if needed
+    if not dev:
+        build_container(
+            runtime,
+            build_context,
+            cache_from=cache_from,
+            cache_to=cache_to,
+            build_secrets=build_secrets,
+        )
+
+    clean_up_old_containers(runtime, [c.run_id for c in run_configs])
+
+    # Log container names for easy reference
+    typer.secho("\nStarting containers:", fg=typer.colors.BLUE)
+    for config in run_configs:
+        typer.secho(f"  chalk_run_{config.run_id}", fg=typer.colors.BLUE)
+    typer.echo()
+
+    # Run containers in parallel using threads
+    run_fn = partial(
+        run_containerized,
+        runtime=runtime,
+        dev=dev,
+        log_file=None,
+        keep_container=keep_containers,
+        build_context=build_context,
+        mounts=mounts,
+        proxy_url=proxy_url,
+        prepare_only=prepare_only,
+        parallel_runs=len(run_configs),
+    )
+
+    # A held --prepare-only container blocks its `podman run` indefinitely, so a
+    # stop signal must tear the containers down before the executor's exit waits
+    # on the worker threads — otherwise the process hangs and orphans the
+    # containers. Stopping is also the right response to interrupting a real run.
+    def exit_code(config: EvaluationRunConfig) -> int:
+        from chalk.firecracker import FirecrackerError
+        from chalk.modal_runtime import ModalError
+
+        try:
+            run_fn(config)
+        except subprocess.CalledProcessError as e:
+            return e.returncode
+        except (FirecrackerError, ModalError) as e:
+            # One VM that can't start fails its run, not every run in the
+            # invocation.
+            logger.error(f"Run {config.run_id}: {e}")
+            return 1
+        return 0
+
+    executor = ThreadPoolExecutor(max_workers=len(run_configs))
+    exit_codes = [0] * len(run_configs)
+    try:
+        exit_codes = list(executor.map(exit_code, run_configs))
+    except KeyboardInterrupt:
+        stop_containers(runtime, [c.run_id for c in run_configs])
+        if not prepare_only:
+            raise
+    finally:
+        executor.shutdown(wait=True)
+
+    if not prepare_only:
+        _print_output_paths(run_configs)
+
+    # Log completion message with copy example if containers are preserved
+    if keep_containers and runtime != "firecracker":
+        typer.secho(
+            f"\nContainers preserved. To copy data:\n  {copy_hint(runtime, run_configs[0].run_id)}",
+            fg=typer.colors.BLUE,
+        )
+
+    failed = [
+        (config.run_id, code)
+        for config, code in zip(run_configs, exit_codes, strict=True)
+        if code != 0
+    ]
+    if failed:
+        for run_id, code in failed:
+            typer.secho(
+                f"chalk_run_{run_id} failed (exit code {code}).",
+                fg=typer.colors.RED,
+                err=True,
+            )
+        raise typer.Exit(failed[0][1] if len(run_configs) == 1 else 1)
+
+
+def _print_output_paths(run_configs: list[EvaluationRunConfig]) -> None:
+    """Print where each containerized run's transcript and artifacts are on the host."""
+    for config in run_configs:
+        if not config.transcript_file:
+            continue
+        transcript = Path(config.transcript_file).absolute()
+        if transcript.is_file():
+            typer.secho(f"\nTranscript: {transcript}", fg=typer.colors.BLUE)
+        artifact_dirs = sorted(
+            transcript.parent.glob(f"{glob.escape(config.run_id)}_artifacts*"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if artifact_dirs:
+            typer.secho(f"Artifacts:  {artifact_dirs[-1]}", fg=typer.colors.BLUE)
+
+
+def _expand_mount_file_references(mounts: list[str]) -> list[str]:
+    """Expand @file references in mount specs.
+
+    If a mount spec starts with ``@``, the remainder is treated as a path to a
+    text file containing one mount spec per line.  Blank lines and lines whose
+    first non-whitespace character is ``#`` are skipped.
+    """
+    expanded: list[str] = []
+    for spec in mounts:
+        if spec.startswith("@"):
+            file_path = Path(spec[1:])
+            if not file_path.is_file():
+                _print_and_abort(f"Mount file not found: {file_path}")
+            for line in file_path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                expanded.append(line)
+        else:
+            expanded.append(spec)
+    return expanded
+
+
+def _validate_mount_specs(mounts: list[str]) -> None:
+    for spec in mounts:
+        parts = spec.split(":")
+        if len(parts) < 2 or len(parts) > 3:
+            _print_and_abort(
+                f"Invalid mount spec: {spec!r}. Expected format: source:target[:ro]"
+            )
+        if len(parts) == 3 and parts[2] != "ro":
+            _print_and_abort(
+                f"Unsupported mount option {parts[2]!r} in {spec!r}. "
+                + "Only ':ro' (read-only) is supported."
+            )
+        target = parts[1]
+        if not target or not target.startswith("/"):
+            _print_and_abort(
+                f"Mount target must be a non-empty absolute path, got {target!r} in {spec!r}"
+            )
+        source = Path(parts[0])
+        if not source.exists():
+            _print_and_abort(
+                f"Mount source path does not exist: {parts[0]!r} in {spec!r}"
+            )
+
+
+def _print_and_abort(message: str) -> Never:
+    typer.secho(
+        message,
+        fg=typer.colors.RED,
+        err=True,
+    )
+    raise typer.Abort()

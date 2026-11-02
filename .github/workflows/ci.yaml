@@ -1,0 +1,190 @@
+name: CI
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Lint
+        run: just lint
+
+  core-tests:
+    name: Core Tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    env:
+      UV_COMPILE_BYTECODE: 1
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      # More workers than CPUs: many tests wait on subprocesses and timeouts.
+      - name: Run tests
+        run: just test --numprocesses=12
+
+  root-tests:
+    name: Root Tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Install dependencies
+        run: uv sync --frozen --extra test
+      - name: Let the demoted test users reach the venv
+        run: |
+          sudo chmod o+x /home/runner
+          namei -l "$(readlink -f .venv/bin/python)"
+      # The sandbox checks OOM-kill a student in a child cgroup. In the runner
+      # service's own cgroup, systemd's default OOMPolicy=stop would then stop
+      # the runner, so the tests get a scope of their own.
+      - name: Run root-only tests
+        run: >-
+          sudo --preserve-env=HOME,PATH,UV_PYTHON_INSTALL_DIR,UV_CACHE_DIR
+          systemd-run --scope --quiet -p OOMPolicy=continue
+          --uid="$(id -u)" --gid="$(id -g)"
+          just test-root
+
+  default-template:
+    name: Default Template Tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    env:
+      CHALK_TEST_FAKE_MODEL: "1"
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Test the default template
+        run: just test-template default --runtime docker
+
+  # The default template end to end in a Firecracker microVM, once as a user
+  # and once through the jailer (under sudo). It needs /dev/kvm, which
+  # GitHub's hosted Ubuntu runners provide.
+  firecracker-template:
+    name: Firecracker Template Test (${{ matrix.mode }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [user, jailed]
+    env:
+      CHALK_TEST_FAKE_MODEL: "1"
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Give the runner user /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install pasta
+        timeout-minutes: 5
+        run: |
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+          sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y passt
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Cache Firecracker and the guest kernel
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/chalk/firecracker
+          key: firecracker-${{ runner.arch }}-${{ hashFiles('src/chalk/firecracker/artifacts.py') }}
+      # Ubuntu confines unprivileged user namespaces with AppArmor, and
+      # its passt package has no profile that lets pasta create one. The
+      # jailed run needs no user namespace.
+      - name: Let pasta create user namespaces
+        if: matrix.mode == 'user'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Test the default template under Firecracker
+        if: matrix.mode == 'user'
+        run: just test-template default --runtime firecracker
+      - name: Set up the default template
+        if: matrix.mode == 'jailed'
+        run: |
+          D="$HOME/.cache/chalk/test-templates/test_default"
+          rm -rf "$D" && mkdir -p "$(dirname "$D")"
+          uv run --frozen chalk create-env "$D" --template default --vendor-chalk
+          (cd "$D" && uv run setup_data.py)
+          just test-run-config "$D"
+      - name: Test the default template under Firecracker's jailer
+        if: matrix.mode == 'jailed'
+        run: |
+          cd "$HOME/.cache/chalk/test-templates/test_default"
+          sudo env "PATH=$PATH" "HOME=$HOME" \
+            CHALK_FIRECRACKER_JAILER=1 \
+            .venv/bin/chalk run --config run_config.json --no-ui --no-proxy --runtime firecracker
+          uv run python "$GITHUB_WORKSPACE/tests/check_transcript.py" out/transcript.json
+
+  all-tests-pass:
+    name: All tests pass
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    needs: [lint, core-tests, root-tests, default-template, firecracker-template]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" == "true" ]]; then
+            echo "One or more jobs failed"
+            exit 1
+          fi
+
+  build:
+    name: Build
+    needs: [lint, core-tests, root-tests, default-template, firecracker-template]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the version counts commits
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Set version
+        id: version
+        run: |
+          base="$(uv version --short --frozen)"
+          version="${base%.*}.$(git rev-list --count HEAD)"
+          uv version --frozen "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build package
+        run: uv build
+      - name: Upload built package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+

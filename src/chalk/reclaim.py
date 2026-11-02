@@ -1,0 +1,773 @@
+"""Free what a uid still holds once its processes are gone."""
+
+import contextlib
+import ctypes
+import errno
+import os
+import stat
+import time
+import warnings
+from collections.abc import Iterator
+from contextvars import ContextVar
+from functools import cache
+from pathlib import Path
+from typing import final
+
+from loguru import logger
+
+from chalk.confinement import STUDENT_FILE_COUNT_LIMIT
+from chalk.container import is_containerized
+from chalk.file_quota import QUOTA_DIR
+from chalk.memory_watch import SYSVIPC_SHM_PATH
+from chalk.student_misbehavior import StudentMisbehaviorError
+
+_IPC_RMID = 0
+_IPC_STAT = 2
+_IPC_PRIVATE = 0
+_IPC_CREAT = 0o1000
+
+_MAX_PROBED_SHMID = 1 << 20
+"""How many ids the walk checks when there is no ``/proc/sysvipc/shm`` to read.
+A uid can churn ids to push its own past this cap and keep that segment."""
+
+SWEEP_TIMEOUT_SECONDS = 600.0
+"""How long the sweeps of one scoring may run between them before it counts as
+the uid stalling them. Well above a full sweep of the largest tree a uid may
+hold, and well under the grading timeout that would otherwise fail the run as
+infra."""
+
+SWEEP_ENTRY_BUDGET = 2 * STUDENT_FILE_COUNT_LIMIT
+"""How many directory entries the sweeps of one scoring may read between them.
+Hardlinks give a uid far more entries than its file quota, each costing a stat."""
+
+_CAP_IPC_OWNER = 15
+
+_SHOWN_FAILURES = 10
+
+MOUNTS_PATH = Path("/proc/self/mounts")
+STATUS_PATH = Path("/proc/self/status")
+
+DEFAULT_INCLUDE = (Path("/"),)
+
+DEFAULT_EXCLUDE = (Path("/root"), QUOTA_DIR)
+"""Spared unless the caller says otherwise: root's own files, and the file
+quota's upper layers — those hold the same files as the overlays mounted over
+them, and reaching behind a mounted overlay to change its upper layer is not
+something overlayfs supports."""
+
+EXCLUDE_ENV_VAR = "CHALK_RECLAIM_EXCLUDE"
+"""Extra paths every sweep spares, ``os.pathsep``-separated. Set by an image
+that hosts things chalk did not create but must outlive a sweep, e.g. an
+external harness's log mounts or the agent it installed as the student."""
+
+
+def _env_excludes() -> tuple[Path, ...]:
+    raw = os.environ.get(EXCLUDE_ENV_VAR, "")
+    return tuple(Path(part) for part in raw.split(os.pathsep) if part)
+
+
+_VIRTUAL_FSTYPES = frozenset(
+    {
+        "autofs",
+        "binfmt_misc",
+        "bpf",
+        "cgroup",
+        "cgroup2",
+        "configfs",
+        "debugfs",
+        "devpts",
+        "devtmpfs",
+        "efivarfs",
+        "fusectl",
+        "hugetlbfs",
+        "mqueue",
+        "nsfs",
+        "proc",
+        "pstore",
+        "rpc_pipefs",
+        "securityfs",
+        "selinuxfs",
+        "sysfs",
+        "tracefs",
+    }
+)
+
+
+class ReclaimError(StudentMisbehaviorError):
+    """Some of what the uid owns could not be deleted."""
+
+
+@final
+class _Budget:
+    """Seconds of sweeping and directory entries read that sweeps may still
+    spend; spending draws on ``outer`` too, which can stop a sweep on its own."""
+
+    __slots__ = ("_seconds", "_entries", "_spent", "_read", "_since", "_outer")
+
+    def __init__(
+        self,
+        seconds: float | None,
+        entries: int | None,
+        outer: "_Budget | None" = None,
+    ):
+        self._seconds = seconds
+        self._entries = entries
+        self._spent = 0.0
+        self._read = 0
+        self._since = 0.0
+        self._outer = outer
+
+    def start(self, now: float) -> None:
+        self._since = now
+        if self._outer is not None:
+            self._outer.start(now)
+
+    def stop(self, now: float) -> None:
+        self._spent += now - self._since
+        if self._outer is not None:
+            self._outer.stop(now)
+
+    def read(self, entries: int) -> None:
+        self._read += entries
+        if self._outer is not None:
+            self._outer.read(entries)
+
+    def left(self) -> int | None:
+        own = None if self._entries is None else self._entries - self._read
+        outer = None if self._outer is None else self._outer.left()
+        if own is None or outer is None:
+            return outer if own is None else own
+        return min(own, outer)
+
+    def exceeded(self, now: float) -> str | None:
+        """What the sweep ran past, or ``None`` while it is inside every bound."""
+        if (
+            self._seconds is not None
+            and self._spent + now - self._since > self._seconds
+        ):
+            return f"took longer than {self._seconds:g}s"
+        if self._entries is not None and self._read > self._entries:
+            return f"read more than {self._entries:,} directory entries"
+        return None if self._outer is None else self._outer.exceeded(now)
+
+
+_shared_budget: ContextVar[_Budget | None] = ContextVar(
+    "chalk_sweep_budget", default=None
+)
+
+
+@contextlib.contextmanager
+def shared_sweep_budget() -> Iterator[None]:
+    """Make every :func:`delete_files` call in the block draw on one budget."""
+    token = _shared_budget.set(_Budget(SWEEP_TIMEOUT_SECONDS, SWEEP_ENTRY_BUDGET))
+    try:
+        yield
+    finally:
+        _shared_budget.reset(token)
+
+
+@final
+class _IpcPerm(ctypes.Structure):
+    """The head of ``struct ipc_perm``, five 32-bit fields on every Linux ABI
+    chalk runs on."""
+
+    _fields_ = (
+        ("key", ctypes.c_int32),
+        ("uid", ctypes.c_uint32),
+        ("gid", ctypes.c_uint32),
+        ("cuid", ctypes.c_uint32),
+        ("cgid", ctypes.c_uint32),
+    )
+
+
+@final
+class _ShmidDs(ctypes.Structure):
+    """``struct shmid_ds``, of which only the permissions are read. The tail is
+    room for whatever the ABI puts after them."""
+
+    _fields_ = (("perm", _IpcPerm), ("_rest", ctypes.c_byte * 256))
+
+
+def delete_files(
+    uid: int,
+    include: tuple[Path, ...] | None = None,
+    exclude: tuple[Path, ...] = DEFAULT_EXCLUDE,
+    extend_exclude: tuple[Path, ...] = (),
+    directories: tuple[Path, ...] | None = None,
+    timeout: float | None = SWEEP_TIMEOUT_SECONDS,
+) -> int:
+    """Delete everything ``uid`` owns under ``include`` (by default the whole
+    filesystem, sparing read-only and virtual filesystems, the
+    :data:`DEFAULT_EXCLUDE` paths, anything at or under an
+    ``exclude``/``extend_exclude`` path, and the paths named in
+    :data:`EXCLUDE_ENV_VAR`), plus the SysV shared-memory segments it created. Returns how many things were removed; raises
+    :class:`ReclaimError` if anything else of the uid's survived, if the sweep
+    ran past ``timeout`` seconds (``None`` waits as long as it takes), or if it
+    ran out of the budget it shares with the other sweeps of a scoring.
+
+    Sweeping the whole filesystem is refused outside a chalk container, where
+    the uid is likely a real user of the machine.
+    """
+    if directories is not None:
+        if include is not None:
+            raise TypeError("pass either include or directories, not both")
+        warnings.warn(
+            "delete_files(directories=...) is deprecated; use include=...",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        include = directories
+    if include is None:
+        include = DEFAULT_INCLUDE
+    roots = tuple(os.path.abspath(path) for path in include)
+    if "/" in roots and not is_containerized():
+        logger.warning(
+            f"Not sweeping the whole filesystem outside a chalk container: uid {uid} may be a real user of this machine"
+        )
+        return 0
+    excluded = tuple(
+        os.path.abspath(path) for path in exclude + extend_exclude + _env_excludes()
+    )
+    mounts = _mount_table(require_mounts="/" in roots)
+    shared = _shared_budget.get()
+    budget = _Budget(timeout, SWEEP_ENTRY_BUDGET if shared is None else None, shared)
+    budget.start(time.monotonic())
+    try:
+        removed, failed = _delete_owned(uid, roots, excluded, mounts, budget)
+    finally:
+        budget.stop(time.monotonic())
+    removed += _remove_sysv_segments(uid)
+    if removed:
+        logger.info(f"Deleted {removed} thing(s) owned by uid {uid}")
+    if failed.count:
+        shown = ", ".join(failed.shown)
+        if failed.count > len(failed.shown):
+            shown += f", and {failed.count - len(failed.shown)} more"
+        raise ReclaimError(
+            f"Could not delete {failed.count} path(s) owned by uid {uid}: {shown}"
+        )
+    return removed
+
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+
+
+@final
+class _Frame:
+    """A directory being swept; only the top of the stack holds an open fd, and
+    a parent gets it back on the way out. ``path`` is ``None`` once it is
+    longer than any mount point or exclude, which nothing below can then be."""
+
+    __slots__ = (
+        "fd",
+        "path",
+        "name",
+        "owned",
+        "names",
+        "next",
+        "dev",
+        "ino",
+        "sweepable",
+    )
+
+    def __init__(
+        self,
+        fd: int,
+        path: str | None,
+        name: str,
+        owned: bool,
+        names: list[str],
+        sweepable: bool,
+    ):
+        self.fd = fd
+        self.path = path
+        self.name = name
+        self.owned = owned
+        self.names = names
+        self.sweepable = sweepable
+        self.next = 0
+        st = os.fstat(fd)
+        self.dev, self.ino = st.st_dev, st.st_ino
+
+
+@final
+class _Failures:
+    """How many paths could not be deleted, and the first few of them."""
+
+    __slots__ = ("count", "shown")
+
+    def __init__(self):
+        self.count = 0
+        self.shown: list[str] = []
+
+    def add(self, stack: list[_Frame], name: str | None = None) -> None:
+        self.count += 1
+        if len(self.shown) < _SHOWN_FAILURES:
+            self.shown.append(_describe(stack, name))
+
+
+@final
+class _Mounts:
+    """Which filesystem a path sits on and whether that one may be swept;
+    read-only and virtual filesystems may not. A ``None`` path lies too deep to
+    be or hold a mount point."""
+
+    __slots__ = ("_sweepable", "_points", "longest")
+
+    def __init__(self, sweepable: dict[str, bool]):
+        self._sweepable = sweepable
+        self._points = tuple(point for point, ok in sweepable.items() if ok)
+        self.longest = max(map(len, sweepable), default=0)
+
+    def point(self, path: str | None) -> bool:
+        """Whether something is mounted exactly at ``path``, which makes it
+        none of a sweep's business to remove."""
+        return path is not None and path in self._sweepable
+
+    def at(self, path: str | None, inherited: bool) -> bool:
+        """Whether what sits at ``path`` may be swept: the mount there says so,
+        or, with nothing mounted there, the filesystem it is part of."""
+        if path is None:
+            return inherited
+        return self._sweepable.get(path, inherited)
+
+    def under(self, path: str | None) -> bool:
+        """Whether a sweepable filesystem is mounted somewhere below ``path``,
+        which is reason enough to walk through a filesystem that is not."""
+        if path is None:
+            return False
+        prefix = path if path.endswith("/") else path + "/"
+        return any(point.startswith(prefix) for point in self._points)
+
+    def around(self, path: str) -> bool:
+        """Whether the filesystem holding ``path`` may be swept, taken from the
+        longest mount point it sits under. For a sweep root, which need not be
+        a mount point itself."""
+        longest = ""
+        sweepable = True
+        for point, ok in self._sweepable.items():
+            if len(point) < len(longest):
+                continue
+            if path == point or path.startswith(point.rstrip("/") + "/"):
+                longest, sweepable = point, ok
+        return sweepable
+
+
+def _mount_table(require_mounts: bool) -> _Mounts:
+    """Every mount point, and whether its filesystem may be swept."""
+    try:
+        lines = MOUNTS_PATH.read_text().splitlines()
+    except OSError as exc:
+        if require_mounts:
+            raise ReclaimError(
+                f"cannot read {MOUNTS_PATH} to find unsweepable mounts: {exc}"
+            ) from exc
+        return _Mounts({})
+    sweepable: dict[str, bool] = {}
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        fstype, options = fields[2], fields[3]
+        sweepable[_unescape(fields[1])] = not (
+            fstype in _VIRTUAL_FSTYPES or "ro" in options.split(",")
+        )
+    return _Mounts(sweepable)
+
+
+def _unescape(field: str) -> str:
+    """Undo the octal escapes /proc/self/mounts uses for whitespace."""
+    escapes = (("\\011", "\t"), ("\\012", "\n"), ("\\040", " "), ("\\134", "\\"))
+    for escape, char in escapes:
+        field = field.replace(escape, char)
+    return field
+
+
+def _delete_owned(
+    uid: int,
+    roots: tuple[str, ...],
+    excluded: tuple[str, ...],
+    mounts: _Mounts,
+    budget: _Budget,
+) -> tuple[int, _Failures]:
+    removed = 0
+    failed = _Failures()
+    for root in roots:
+        removed += _sweep(uid, root, excluded, mounts, failed, budget, removed)
+    return removed, failed
+
+
+def _is_excluded(path: str | None, excluded: tuple[str, ...]) -> bool:
+    return path is not None and any(
+        path == e or path.startswith(e + "/") for e in excluded
+    )
+
+
+def _child_path(parent: str, name: str) -> str:
+    return f"/{name}" if parent == "/" else f"{parent}/{name}"
+
+
+def _describe(stack: list[_Frame], name: str | None = None) -> str:
+    """The path of ``name`` in the top frame, or of the top frame itself, with
+    the levels whose path is not kept elided."""
+    top = anchor = len(stack) - 1
+    while (path := stack[anchor].path) is None:
+        anchor -= 1
+    elided = top - anchor
+    if name is None:
+        if not elided:
+            return path
+        name = stack[top].name
+        elided -= 1
+    if not elided:
+        return _child_path(path, name)
+    return f"{_child_path(path, '…')}(+{elided:,} levels)/{name}"
+
+
+def _list(fd: int, budget: _Budget) -> list[str]:
+    """The names in a directory, read no further than one past what the budget
+    has left, so one huge directory costs no more than the budget."""
+    left = budget.left()
+    names: list[str] = []
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            names.append(entry.name)
+            if left is not None and len(names) > left:
+                break
+    budget.read(len(names))
+    return names
+
+
+def _sweep(
+    uid: int,
+    root: str,
+    excluded: tuple[str, ...],
+    mounts: _Mounts,
+    failed: _Failures,
+    budget: _Budget,
+    already_removed: int = 0,
+) -> int:
+    """Delete with dir-fd-relative syscalls only: each component is bounded by
+    NAME_MAX, so a deep tree cannot push a call past PATH_MAX."""
+    if _is_excluded(root, excluded):
+        return 0
+    tracked = max(mounts.longest, *map(len, excluded), 0)
+    try:
+        fd = os.open(root, _DIR_FLAGS)
+    except OSError:
+        return 0
+    try:
+        names = _list(fd, budget)
+    except OSError:
+        os.close(fd)
+        return 0
+    removed = 0
+    stack = [_Frame(fd, root, root, False, names, mounts.around(root))]
+    try:
+        while stack:
+            frame = stack[-1]
+            exceeded = budget.exceeded(time.monotonic())
+            if exceeded is not None:
+                done = already_removed + removed
+                raise ReclaimError(
+                    f"Sweeping what uid {uid} owns {exceeded}; deleted {done} thing(s) before giving up at {_describe(stack)}"
+                )
+            if frame.next < len(frame.names):
+                name = frame.names[frame.next]
+                frame.next += 1
+                removed += _sweep_entry(
+                    uid, frame, name, stack, excluded, mounts, failed, tracked, budget
+                )
+                continue
+            stack.pop()
+            if not stack:
+                os.close(frame.fd)
+                break
+            parent = stack[-1]
+            try:
+                parent.fd = _reopen_parent(frame, parent)
+            except OSError:
+                failed.add(stack)
+                return removed
+            if not frame.owned:
+                continue
+            try:
+                os.rmdir(frame.name, dir_fd=parent.fd)
+                removed += 1
+            except OSError as exc:
+                if exc.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+                    failed.add(stack, frame.name)
+    except BaseException:
+        for frame in stack:
+            if frame.fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(frame.fd)
+        raise
+    return removed
+
+
+def _sweep_entry(
+    uid: int,
+    frame: _Frame,
+    name: str,
+    stack: list[_Frame],
+    excluded: tuple[str, ...],
+    mounts: _Mounts,
+    failed: _Failures,
+    tracked: int,
+    budget: _Budget,
+) -> int:
+    path = None if frame.path is None else _child_path(frame.path, name)
+    if _is_excluded(path, excluded):
+        return 0
+    try:
+        st = os.stat(name, dir_fd=frame.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        if not frame.sweepable:
+            return 0
+        failed.add(stack, name)
+        return 0
+    if stat.S_ISDIR(st.st_mode):
+        return _enter(uid, frame, name, path, stack, mounts, failed, tracked, budget)
+    if st.st_uid != uid or not mounts.at(path, frame.sweepable):
+        return 0
+    try:
+        os.unlink(name, dir_fd=frame.fd)
+        return 1
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        failed.add(stack, name)
+        return 0
+
+
+def _enter(
+    uid: int,
+    parent: _Frame,
+    name: str,
+    path: str | None,
+    stack: list[_Frame],
+    mounts: _Mounts,
+    failed: _Failures,
+    tracked: int,
+    budget: _Budget,
+) -> int:
+    """Descend even into other uids' dirs: uid files can live there. A dir we
+    cannot see into might hold the uid's files, so it fails the reclaim. A
+    filesystem that may not be swept is walked only to reach one that may, and
+    nothing in it counts as missed."""
+    sweepable = mounts.at(path, parent.sweepable)
+    if not sweepable and not mounts.under(path):
+        return 0
+    try:
+        fd = os.open(name, _DIR_FLAGS | os.O_NOFOLLOW, dir_fd=parent.fd)
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        if sweepable:
+            failed.add(stack, name)
+        return 0
+    entry_uid = os.fstat(fd).st_uid
+    try:
+        names = _list(fd, budget)
+    except OSError:
+        os.close(fd)
+        if sweepable:
+            failed.add(stack, name)
+        return 0
+    owned = sweepable and entry_uid == uid and not mounts.point(path)
+    if path is not None and len(path) > tracked:
+        path = None
+    child = _Frame(fd, path, name, owned, names, sweepable)
+    os.close(parent.fd)
+    parent.fd = -1
+    stack.append(child)
+    return 0
+
+
+def _reopen_parent(frame: _Frame, parent: _Frame) -> int:
+    """Climb back out through ".." and check we surfaced where we dove in."""
+    try:
+        fd = os.open("..", _DIR_FLAGS, dir_fd=frame.fd)
+    finally:
+        os.close(frame.fd)
+    st = os.fstat(fd)
+    if (st.st_dev, st.st_ino) != (parent.dev, parent.ino):
+        os.close(fd)
+        raise OSError(errno.ESTALE, "directory moved during sweep", parent.path)
+    return fd
+
+
+def _remove_sysv_segments(uid: int) -> int:
+    """Mark the segments the uid created for destruction.
+
+    Charged to the creator (``cuid``), consistent with how the memory watch
+    weighs them: the owner field is the segment's to rewrite, the creator is
+    not.
+    """
+    shmids = _listed_segments(uid)
+    if shmids is None:
+        return _remove_unlisted_segments(uid)
+    return sum(1 for shmid in shmids if _shmctl_rmid(shmid))
+
+
+def _listed_segments(uid: int) -> list[int] | None:
+    """The uid's segments as ``/proc/sysvipc/shm`` lists them, or ``None``
+    where the kernel does not publish the file, as gVisor's does not."""
+    try:
+        rows = SYSVIPC_SHM_PATH.read_text().splitlines()[1:]
+    except OSError:
+        return None
+    shmids: list[int] = []
+    for row in rows:
+        fields = row.split()
+        try:
+            shmid, creator = int(fields[1]), int(fields[9])
+        except (IndexError, ValueError):
+            continue
+        if creator == uid:
+            shmids.append(shmid)
+    return shmids
+
+
+def _remove_unlisted_segments(uid: int) -> int:
+    """Destroy the uid's segments on a kernel that lists none of them, as
+    gVisor's does not. Reading a segment's creator needs read permission on it,
+    so the walk runs as the uid in a child unless we hold CAP_IPC_OWNER."""
+    ceiling = _allocation_ceiling()
+    if ceiling is None:
+        return 0
+    last = min(ceiling, _MAX_PROBED_SHMID)
+    if ceiling > last:
+        logger.warning(
+            f"Only the first {last} SysV ids were walked, of {ceiling} handed out; segments the uid parked above that stay"
+        )
+    if os.geteuid() == uid or _holds_ipc_owner():
+        return _destroy_owned_segments(uid, last)
+    if os.geteuid() != 0:
+        logger.warning(
+            f"Cannot become uid {uid} to find its SysV segments, and this kernel lists none"
+        )
+        return 0
+    return _destroy_owned_segments_as_uid(uid, last)
+
+
+def _holds_ipc_owner() -> bool:
+    """Whether we may read any segment's creator, which also reaches the ones a
+    uid made unreadable to itself."""
+    try:
+        status = STATUS_PATH.read_text()
+    except OSError:
+        return False
+    for line in status.splitlines():
+        if line.startswith("CapEff:"):
+            return bool(int(line.split(":")[1], 16) >> _CAP_IPC_OWNER & 1)
+    return False
+
+
+def _destroy_owned_segments(uid: int, last: int) -> int:
+    """Destroy every segment up to ``last`` that ``uid`` created. Runs with
+    credentials that may read the creator, the uid's own or CAP_IPC_OWNER."""
+    destroyed = 0
+    for shmid in range(last + 1):
+        perm = _shmctl_stat(shmid)
+        if perm is not None and perm.cuid == uid and _shmctl_rmid(shmid, quiet=True):
+            destroyed += 1
+    return destroyed
+
+
+def _destroy_owned_segments_as_uid(uid: int, last: int) -> int:
+    """Run :func:`_destroy_owned_segments` in a child that has become the uid,
+    and read back how many fell. The child only makes syscalls, since logging
+    or allocating across a fork in a threaded process risks deadlock."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        destroyed = -1
+        try:
+            os.setgroups([])
+            os.setgid(uid)
+            os.setuid(uid)
+            destroyed = _destroy_owned_segments(uid, last)
+        except BaseException:
+            destroyed = -1
+        finally:
+            try:
+                _ = os.write(write_fd, str(destroyed).encode())
+            except OSError:
+                pass
+            os._exit(0)
+    os.close(write_fd)
+    try:
+        with os.fdopen(read_fd, "rb") as reported:
+            answer = reported.read()
+    finally:
+        _ = os.waitpid(pid, 0)
+    try:
+        destroyed = int(answer)
+    except ValueError:
+        destroyed = -1
+    if destroyed < 0:
+        logger.warning(f"Could not walk the SysV id space as uid {uid}")
+        return 0
+    return destroyed
+
+
+def _allocation_ceiling() -> int | None:
+    """An id above every one in use, learned by taking the next one: ids only
+    ever climb. A uid that has pinned every segment the kernel allows leaves
+    none to take, and the walk then runs to its own bound instead."""
+    libc = _libc()
+    if libc is None:
+        return None
+    ctypes.set_errno(0)
+    shmid = libc.shmget(_IPC_PRIVATE, 1, _IPC_CREAT | 0o600)
+    if shmid < 0:
+        if ctypes.get_errno() != errno.ENOSPC:
+            logger.warning(
+                f"Could not take a SysV id to bound the walk: errno {ctypes.get_errno()}"
+            )
+            return None
+        return _MAX_PROBED_SHMID
+    _ = libc.shmctl(shmid, _IPC_RMID, None)
+    return shmid
+
+
+def _shmctl_stat(shmid: int) -> _IpcPerm | None:
+    """The segment's permissions, or ``None`` if there is no such segment or it
+    will not say."""
+    libc = _libc()
+    if libc is None:
+        return None
+    segment = _ShmidDs()
+    if libc.shmctl(shmid, _IPC_STAT, ctypes.byref(segment)) != 0:
+        return None
+    return segment.perm
+
+
+def _shmctl_rmid(shmid: int, quiet: bool = False) -> bool:
+    """``shmctl(IPC_RMID)`` as a syscall of our own, rather than a call out to
+    ``ipcrm``, so path and symlink hijacks have nothing to grab. A walk of the
+    id space asks after ids that were never handed out, and says nothing when
+    they turn out not to be there."""
+    libc = _libc()
+    if libc is None:
+        return False
+    if libc.shmctl(shmid, _IPC_RMID, None) != 0:
+        if not quiet:
+            logger.warning(
+                f"Could not remove SysV segment {shmid}: errno {ctypes.get_errno()}"
+            )
+        return False
+    return True
+
+
+@cache
+def _libc() -> ctypes.CDLL | None:
+    try:
+        return ctypes.CDLL(None, use_errno=True)
+    except OSError as exc:
+        logger.warning(f"No libc to call shmctl through: {exc}")
+        return None

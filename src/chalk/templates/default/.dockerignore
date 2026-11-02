@@ -1,0 +1,14 @@
+student_data/.gitkeep
+shared_data/.gitkeep
+root_data/.gitkeep
+intermediate_data/.gitkeep
+**/.venv
+**/__pycache__
+**/*.egg-info
+.pytest_cache
+.ruff_cache
+.chalk/.git
+post_create.py
+
+.chalk-template-base/
+.chalk-update-backup/

@@ -1,0 +1,47 @@
+import re
+from collections.abc import Sequence
+from typing import Final, override
+
+from chalk.judges.judge import Judge
+from chalk.schemas.chat import Message
+from chalk.schemas.scoring import Metadata, Score, Scoring
+from chalk.schemas.transcript import Transcript
+
+
+class RegexJudge(Judge):
+    """The messages the model wrote must match the expected patterns via `re.search`.
+
+    The patterns get matched against the concatenated text of all assistant
+    messages. Other roles, reasoning, and non-text content are excluded.
+    """
+
+    def __init__(self, expected: Sequence[re.Pattern[str]]) -> None:
+        self.expected: Final = expected
+
+    @override
+    def evaluate(self, transcript: Transcript) -> Scoring:
+        full_transcript = "\n\n".join(
+            text
+            for m in transcript.messages
+            if m.role == "assistant" and (text := _message_text(m))
+        )
+
+        score: Score = 1.0
+        metadata: Metadata = {}
+
+        for expected in self.expected:
+            if not expected.search(full_transcript):
+                score = 0.0
+                metadata[expected.pattern] = "Transcript contains no match."
+
+        return Scoring(score, metadata, score == 1.0)
+
+
+def _message_text(message: Message) -> str:
+    if isinstance(message.content, str):
+        return message.content
+    return "\n\n".join(
+        part["text"]
+        for part in message.content or []
+        if part.get("type") == "text" and isinstance(part.get("text"), str)
+    )

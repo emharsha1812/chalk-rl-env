@@ -1,0 +1,499 @@
+import asyncio
+import random
+import re
+import socket
+import warnings
+from collections.abc import AsyncGenerator, Iterator
+from dataclasses import dataclass
+from typing import Any, final
+
+import aiohttp
+import httpx
+import litellm
+import litellm.exceptions
+from litellm import (
+    ChatCompletionToolParam,
+    Choices,
+    CustomStreamWrapper,
+)
+from litellm.types.utils import ModelResponse, ModelResponseStream, StreamingChoices
+from loguru import logger
+
+from chalk.model_spec import spec_for
+from chalk.providers import (
+    TOOL_CALL_REPAIRS,
+    ProviderAuth,
+    cache_tokens,
+    provider_for,
+    repair_tool_calls,
+    service_tier_mode,
+    vertex_served_tier,
+)
+from chalk.schemas.chat import Delta, Message
+from chalk.schemas.evaluation_run_config import EvaluationRunConfig
+from chalk.schemas.transcript import (
+    Event,
+    MessageAddedEvent,
+    MessageChunkEvent,
+    MessageChunkResetEvent,
+    TokenUsageEvent,
+)
+
+# litellm's success logging for Responses API streams dumps a chat usage dict into ResponseAPIUsage.
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
+
+# Retry configuration for transient LLM errors (overloaded, rate-limited, etc.)
+# 16 retries lead to a maximum wait time of around 10 minutes
+LLM_RETRY_MAX_ATTEMPTS = 16
+LLM_RETRY_WAIT_MIN_S = 1
+LLM_RETRY_WAIT_MAX_S = 60
+LLM_RETRY_AFTER_MAX_S = 300
+
+_RETRYABLE_EXCEPTIONS = (
+    litellm.exceptions.InternalServerError,
+    litellm.exceptions.RateLimitError,
+    litellm.exceptions.ServiceUnavailableError,
+    litellm.exceptions.Timeout,
+    litellm.exceptions.APIConnectionError,
+)
+
+# A 401 is usually permanent, but providers do sometimes return false negatives.
+AUTH_RETRY_MAX_ATTEMPTS = 3
+
+# Unknown host or refused connection: a few quick tries ride out a blip.
+UNREACHABLE_RETRY_MAX_ATTEMPTS = 4
+
+_DNS_NOT_FOUND = {socket.EAI_NONAME, socket.EAI_NODATA}
+_INVALID_URL_ERRORS = (
+    httpx.InvalidURL,
+    httpx.UnsupportedProtocol,
+    aiohttp.InvalidURL,
+    aiohttp.NonHttpUrlClientError,
+)
+
+IMAGE_OMITTED_TEXT = "[image omitted: this model cannot take image input]"
+
+_RETRY_AFTER_BODY_RE = re.compile(r'"retry_after"\s*:\s*(\d+(?:\.\d+)?)')
+
+# How Together and Fireworks (and litellm on Fireworks' behalf) word a 400 for
+# an image sent to a text-only model.
+_IMAGES_REJECTED_RE = re.compile(
+    r"multimodal[ _]not[ _]supported|does not support image inputs", re.IGNORECASE
+)
+
+# How SGLang and vLLM word a 400 for a prompt that, with the requested output,
+# doesn't fit the model's context window.
+_CONTEXT_WINDOW_FULL_RE = re.compile(r"context length", re.IGNORECASE)
+
+
+def _rejects_images(exc: Exception) -> bool:
+    return isinstance(exc, litellm.exceptions.BadRequestError) and bool(
+        _IMAGES_REJECTED_RE.search(str(exc))
+    )
+
+
+def _context_window_full(exc: Exception) -> bool:
+    # litellm maps only some of the ways servers word a full context window to
+    # ContextWindowExceededError; SGLang's "Requested token count exceeds the
+    # model's maximum context length" arrives as a plain 400.
+    return isinstance(exc, litellm.exceptions.ContextWindowExceededError) or (
+        isinstance(exc, litellm.exceptions.BadRequestError)
+        and bool(_CONTEXT_WINDOW_FULL_RE.search(str(exc)))
+    )
+
+
+def _has_reasoning(messages: list[Message]) -> bool:
+    return any(m.role == "assistant" and m.reasoning_content for m in messages)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Whether an LLM call failed for a reason worth trying again."""
+    if isinstance(exc, _RETRYABLE_EXCEPTIONS):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    return isinstance(status_code, int) and status_code >= 500
+
+
+def _retry_limit(exc: Exception) -> int:
+    """How many attempts in total an LLM call failing with ``exc`` gets."""
+    if isinstance(exc, litellm.exceptions.AuthenticationError):
+        return AUTH_RETRY_MAX_ATTEMPTS
+    return LLM_RETRY_MAX_ATTEMPTS if _is_retryable(exc) else 1
+
+
+class ModelEndpointUnreachableError(Exception):
+    """The model endpoint could not be reached at all."""
+
+
+@dataclass(frozen=True)
+class _Unreachable:
+    reason: str
+    url: str | None
+    permanent: bool
+
+    def __str__(self) -> str:
+        return f"Could not reach {self.url or 'the model endpoint'}: {self.reason}"
+
+
+def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _request_url(exc: BaseException) -> str | None:
+    if not isinstance(exc, httpx.RequestError):
+        return None
+    try:
+        return str(exc.request.url)
+    except RuntimeError:
+        return None
+
+
+def _unreachable(exc: BaseException) -> _Unreachable | None:
+    """Why the endpoint could not be reached, if the connection itself failed in a
+    way that retrying won't soon fix; litellm reports these as a generic 500."""
+    chain = list(_exception_chain(exc))
+    url = next((u for e in chain if (u := _request_url(e))), None)
+    for e in chain:
+        if isinstance(e, _INVALID_URL_ERRORS):
+            return _Unreachable(
+                "invalid URL (does it start with http:// or https://?)",
+                url or str(e),
+                permanent=True,
+            )
+        if isinstance(e, socket.gaierror) and e.errno in _DNS_NOT_FOUND:
+            return _Unreachable(
+                f"DNS lookup failed ({e.strerror})", url, permanent=False
+            )
+        if isinstance(e, ConnectionRefusedError):
+            return _Unreachable("connection refused", url, permanent=False)
+    return None
+
+
+def _retry_after(exc: Exception) -> float | None:
+    """The provider's requested retry delay in seconds, if it sent one."""
+    headers = getattr(exc, "litellm_response_headers", None)
+    raw = headers.get("retry-after") if headers else None
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+
+    match = _RETRY_AFTER_BODY_RE.search(str(exc))
+    return float(match.group(1)) if match else None
+
+
+def _retry_wait(attempt: int, retry_after: float | None = None) -> float:
+    """Wait before retry attempt number (1-based): the provider's requested delay
+    when it sent one, otherwise exponential backoff with jitter."""
+    if retry_after is not None:
+        return min(max(retry_after, 0.0), LLM_RETRY_AFTER_MAX_S)
+    exp = min(2 ** (attempt - 1), LLM_RETRY_WAIT_MAX_S)
+    return min(
+        LLM_RETRY_WAIT_MAX_S,
+        max(LLM_RETRY_WAIT_MIN_S, exp + random.uniform(0, exp * 0.5)),
+    )
+
+
+def llm_retry_wait(attempt: int, exc: Exception) -> float | None:
+    """Seconds to wait before retrying a call that failed with ``exc`` on try
+    ``attempt`` (1-based), or ``None`` to give up."""
+    if attempt >= _retry_limit(exc):
+        return None
+    return _retry_wait(attempt, _retry_after(exc))
+
+
+def _tap_traffic_types(stream: CustomStreamWrapper) -> list[str]:
+    """Collect Gemini's ``usageMetadata.trafficType``, which litellm drops from the
+    chunks it yields but sets on the provider chunks it builds them from."""
+    seen: list[str] = []
+    create = stream.chunk_creator
+
+    def tap(chunk: Any) -> Any:
+        fields = (getattr(chunk, "_hidden_params", None) or {}).get(
+            "provider_specific_fields"
+        ) or {}
+        if traffic_type := fields.get("traffic_type"):
+            seen.append(str(traffic_type))
+        return create(chunk=chunk)
+
+    stream.chunk_creator = tap
+    return seen
+
+
+def _thinking_blocks(chunks: list[ModelResponseStream]) -> list[dict[str, Any]] | None:
+    """The response's thinking blocks, exactly as the provider signed them.
+
+    litellm's stream_chunk_builder joins each block's text twice, as the signature
+    chunk repeats the whole block.
+    """
+    blocks = [
+        dict(block)
+        for chunk in chunks
+        for block in getattr(chunk.choices[0].delta, "thinking_blocks", None) or []
+        if block.get("signature") or block.get("type") == "redacted_thinking"
+    ]
+    return blocks or None
+
+
+def _reasoning_items(chunks: list[ModelResponseStream]) -> list[dict[str, Any]] | None:
+    """The Responses API reasoning items, which litellm's stream_chunk_builder drops."""
+    items = [
+        dict(item)
+        for chunk in chunks
+        for item in getattr(chunk.choices[0].delta, "reasoning_items", None) or []
+    ]
+    return items or None
+
+
+def _provider_auth(config: EvaluationRunConfig) -> ProviderAuth:
+    return ProviderAuth(api_key=config.model_api_key)
+
+
+@final
+class BuiltinSource:
+    """The builtin agent: chalk produces the model's response itself by driving
+    the litellm turn loop -- streaming completion, chunk assembly, retries on
+    transient errors, and per-provider request quirks."""
+
+    def __init__(self, config: EvaluationRunConfig) -> None:
+        self.config = config
+        self._spec = spec_for(config.model)
+        self._provider = provider_for(self._spec)
+        # Sticky for the run: flipping back to the default tier risks another
+        # replica, and with it the prompt cache.
+        self._escalated = False
+        self._service_tier: str | None = None
+        # Sticky for the run, so later turns don't pay for another 400.
+        self._omit_images = False
+        # Messages before this index go without their reasoning: the context
+        # window filled up while they were the whole conversation. Sticky for
+        # the run, so the history the model sees changes once, not every turn.
+        self._reasoning_dropped_before = 0
+
+    async def collect(
+        self,
+        messages: list[Message],
+        tools: list[ChatCompletionToolParam],
+    ) -> AsyncGenerator[Event]:
+        unreachable_attempts = 0
+        for attempt in range(1, LLM_RETRY_MAX_ATTEMPTS + 1):
+            chunks: list[ModelResponseStream] = []
+
+            try:
+                response = await litellm.acompletion(
+                    **self.get_completion_params(messages, tools)
+                )
+                assert isinstance(response, CustomStreamWrapper)
+                traffic_types = _tap_traffic_types(response)
+
+                async for chunk in response:
+                    assert isinstance(chunk, ModelResponseStream)
+                    assert isinstance(chunk.choices[0], StreamingChoices)
+                    chunks.append(chunk)
+                    yield MessageChunkEvent(
+                        delta=Delta(**chunk.choices[0].delta.model_dump())
+                    )
+
+            except Exception as e:
+                if (
+                    not self._omit_images
+                    and _rejects_images(e)
+                    and attempt < LLM_RETRY_MAX_ATTEMPTS
+                ):
+                    logger.warning(
+                        "{model} does not take image input; replacing images with a note for the rest of the run",
+                        model=self.config.model,
+                    )
+                    self._omit_images = True
+                    yield MessageChunkResetEvent()
+                    continue
+                if (
+                    self._provider.replays_reasoning_content
+                    and _context_window_full(e)
+                    and _has_reasoning(messages[self._reasoning_dropped_before :])
+                    and attempt < LLM_RETRY_MAX_ATTEMPTS
+                ):
+                    logger.warning(
+                        "{model}'s context window is full; leaving out the reasoning of the {n} messages so far",
+                        model=self.config.model,
+                        n=len(messages),
+                    )
+                    self._reasoning_dropped_before = len(messages)
+                    yield MessageChunkResetEvent()
+                    continue
+                if (
+                    not self._escalated
+                    and service_tier_mode() == "auto"
+                    and self._provider.escalates_on(self._spec, e)
+                ):
+                    logger.warning(
+                        "{model} ran out of provider capacity; asking for priority for the rest of the run",
+                        model=self.config.model,
+                    )
+                    self._escalated = True
+                unreachable = _unreachable(e)
+                if unreachable is None:
+                    tries, limit, cause = attempt, _retry_limit(e), type(e).__name__
+                else:
+                    unreachable_attempts += 1
+                    tries, cause = unreachable_attempts, str(unreachable)
+                    limit = (
+                        1 if unreachable.permanent else UNREACHABLE_RETRY_MAX_ATTEMPTS
+                    )
+                if tries < limit and attempt < LLM_RETRY_MAX_ATTEMPTS:
+                    wait = _retry_wait(tries, _retry_after(e))
+                    logger.warning(
+                        "LLM call failed: {cause}; retrying (attempt {next} of {max}) after {wait:.1f}s...",
+                        cause=cause,
+                        next=tries + 1,
+                        max=limit,
+                        wait=wait,
+                    )
+                    yield MessageChunkResetEvent()
+                    await asyncio.sleep(wait)
+                    continue
+                if unreachable is not None:
+                    raise ModelEndpointUnreachableError(str(unreachable)) from e
+                raise
+
+            full_response = litellm.stream_chunk_builder(chunks)
+            assert isinstance(full_response, ModelResponse)
+            choice = full_response.choices[0]
+            assert isinstance(choice, Choices)
+
+            message = Message(**choice.message.model_dump())
+            message.thinking_blocks = (
+                _thinking_blocks(chunks)
+                if self._provider.replays_thinking_blocks
+                else None
+            )
+            message.reasoning_items = (
+                _reasoning_items(chunks)
+                if self._provider.replays_reasoning_items
+                else None
+            )
+
+            for name in self._spec.tool_call_repairs:
+                message.tool_calls = repair_tool_calls(
+                    message.tool_calls, TOOL_CALL_REPAIRS[name]
+                )
+
+            usage = getattr(full_response, "usage", None)
+
+            # litellm normalizes a provider safety refusal (e.g. Claude's native
+            # 'refusal' stop_reason) to the OpenAI 'content_filter' finish_reason.
+            finish_reason = choice.finish_reason
+            if finish_reason == "content_filter":
+                logger.warning(
+                    "Model {model} declined the request (finish_reason=content_filter).",
+                    model=self.config.model,
+                )
+
+            yield MessageAddedEvent(message=message, finish_reason=finish_reason)
+
+            if usage:
+                cache_read_tokens, cache_write_tokens = cache_tokens(usage)
+                yield TokenUsageEvent(
+                    input_tokens=usage.prompt_tokens,
+                    output_tokens=usage.completion_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    service_tier=vertex_served_tier(traffic_types[-1])
+                    if traffic_types
+                    else self._service_tier,
+                )
+            return
+
+    def get_completion_params(
+        self,
+        messages: list[Message],
+        tools: list[ChatCompletionToolParam],
+    ) -> dict[str, Any]:
+        serialized_messages = self._serialize_messages(messages)
+        spec = self._spec
+        self._provider.adapt_messages(spec, serialized_messages)
+        if self._omit_images:
+            serialized_messages = [_without_images(m) for m in serialized_messages]
+        for message in serialized_messages[: self._reasoning_dropped_before]:
+            message["reasoning_content"] = None
+
+        completion_params: dict[str, Any] = {
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "model": self._provider.chat_model(spec),
+            "messages": serialized_messages,
+            "tools": tools,
+            "tool_choice": "auto" if tools else None,
+            "max_tokens": self.config.max_output_tokens or spec.max_output_tokens,
+            "timeout": 300.0,
+            # this is needed for together ai and other such providers, doesn't seem to break
+            # claude api calls, so doing it for everyone
+            "allowed_openai_params": [
+                "tools",
+                "tool_choice",
+                *spec.extra_allowed_openai_params,
+            ],
+        }
+
+        if self.config.temperature is not None:
+            completion_params["temperature"] = self.config.temperature
+
+        completion_params.update(
+            self._provider.request_params(spec, _provider_auth(self.config))
+        )
+
+        if api_base := self._provider.api_base():
+            completion_params["api_base"] = api_base
+
+        self._provider.apply_prompt_caching(
+            self.config.run_id, serialized_messages, completion_params
+        )
+
+        self._provider.apply_reasoning(
+            spec, self.config.applied_reasoning_effort, completion_params
+        )
+
+        self._provider.disable_storage(completion_params)
+
+        self._service_tier = self._provider.apply_service_tier(
+            spec, self._escalated, completion_params
+        )
+
+        return completion_params
+
+    def _serialize_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
+        """Serializes transcript messages to dicts."""
+        return [
+            message.model_dump(
+                exclude={
+                    field
+                    for field in ("thinking_blocks", "reasoning_items")
+                    if getattr(message, field) is None
+                }
+            )
+            for message in messages
+        ]
+
+
+def _without_images(message: dict[str, Any]) -> dict[str, Any]:
+    """``message`` with each image part swapped for a text note."""
+    content = message.get("content")
+    if not isinstance(content, list) or not any(
+        isinstance(part, dict) and part.get("type") == "image_url" for part in content
+    ):
+        return message
+    return {
+        **message,
+        "content": [
+            {"type": "text", "text": IMAGE_OMITTED_TEXT}
+            if isinstance(part, dict) and part.get("type") == "image_url"
+            else part
+            for part in content
+        ],
+    }
