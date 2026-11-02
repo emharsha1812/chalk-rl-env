@@ -26,6 +26,12 @@ the final Chalk image, and build files need additional disk and memory. GPU
 memory needs depend on the model, server version, and context length. We have
 not measured a minimum VM size for the full setup.
 
+As a starting estimate for this single-model evaluation, consider a VM with one
+NVIDIA GPU with around 16 GB of GPU memory, 32 GB of system memory, and 100 GB
+of free disk. This is a planning estimate, not a tested requirement. Other
+models, longer conversations, concurrent runs, or training may need different
+resources.
+
 ## Create the task
 
 From a Chalk checkout that includes the `lean-math` template:
