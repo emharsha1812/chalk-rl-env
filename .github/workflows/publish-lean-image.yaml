@@ -1,21 +1,33 @@
 name: Publish Lean base image
 on:
   workflow_dispatch:
+    inputs:
+      use_local_base:
+        description: Use an existing base on a temporary trusted runner
+        type: boolean
+        default: false
 permissions:
   contents: read
   packages: write
 jobs:
   image:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.use_local_base && fromJSON('["self-hosted", "Linux", "X64", "chalk-release-publisher"]') || 'ubuntu-24.04' }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Make room on the temporary GitHub runner
+        if: ${{ !inputs.use_local_base }}
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
           df -h /
       - name: Download the task and build its Lean base
+        if: ${{ !inputs.use_local_base }}
         run: python3 src/chalk/templates/lean-math/setup_data.py
+      - name: Download the task and licenses for an existing Lean base
+        if: ${{ inputs.use_local_base }}
+        run: |
+          docker image inspect chalk-fineenvs-lean-base:d7056fd >/dev/null
+          python3 src/chalk/templates/lean-math/setup_data.py --data-only
       - name: Add licenses and tag the base image
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}-lean-base:d7056fd-${GITHUB_SHA:0:12}"
