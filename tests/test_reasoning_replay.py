@@ -658,9 +658,15 @@ async def test_self_hosted_model_receives_the_requested_output_limit(
     self_hosted_server: ServeReplies,
 ):
     bodies = self_hosted_server([_thinks_then_reads_a_file("Read it.", "call_1")])
-    config = _self_hosted_config().model_copy(update={"max_output_tokens": 512})
+    config = _self_hosted_config().model_copy(
+        update={
+            "model": "hosted_vllm/Qwen/Qwen2.5-1.5B-Instruct",
+            "max_output_tokens": 512,
+        }
+    )
     await _turn(BuiltinSource(config), [Message(role="user", content="Read a.txt.")])
     assert bodies[0]["max_tokens"] == 512
+    assert bodies[0]["model"] == "Qwen/Qwen2.5-1.5B-Instruct"
 
 
 @pytest.mark.asyncio
