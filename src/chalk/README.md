@@ -30,8 +30,8 @@ and command. See
 
 To create the optional Lean maths environment, run
 `chalk create-env my_lean_env --template lean-math`. See the [task guide](docs/environments/lean-math.md)
-and its generated `LEAN_MATH.md`. It needs a separate image build and
-substantially more memory and disk space. The [GPU machine guide](docs/running/small-model-vm.md)
+and its generated `LEAN_MATH.md`. A [prebuilt Lean base image](https://github.com/emharsha1812/chalk-rl-env/pkgs/container/chalk-rl-env-lean-base)
+is available; the task still needs substantial memory and disk space. The [GPU machine guide](docs/running/small-model-vm.md)
 shows how to connect a small model.
 
 ## Create an environment

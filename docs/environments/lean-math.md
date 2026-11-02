@@ -10,12 +10,17 @@ incorrect proof earns 0.
 chalk create-env my_lean_env --template lean-math
 cd my_lean_env
 uv sync --extra dev
-uv run setup_data.py
+uv run setup_data.py --base-image \
+  ghcr.io/emharsha1812/chalk-rl-env-lean-base@sha256:a5dcd7d4dab35e7616dba28e377b00216f45877b149fdab1005a9df70067d177
 ```
 
-The image is large and takes time to build. See `LEAN_MATH.md` in the generated
-environment for requirements, an API-free check, attribution, and the difference
-between Chalk's scoring isolation and the upstream Harbor task.
+This downloads the [public Lean base image](https://github.com/emharsha1812/chalk-rl-env/pkgs/container/chalk-rl-env-lean-base)
+and checks the separately downloaded task files. Without cached layers, the
+base image downloads about 2.8 GiB; Docker reports its size as about 9.8 GB.
+The first run also builds a smaller Chalk layer on top of it. Alternatively, use
+`uv run setup_data.py` to build the Lean base from source; that takes much longer.
+See `LEAN_MATH.md` in the generated environment for requirements, attribution,
+and the difference between Chalk's scoring isolation and the upstream Harbor task.
 
 ## Check the task without a model
 
@@ -50,10 +55,7 @@ model name:
 uv run chalk run --task finite-congruence-graph --model MODEL_NAME --runtime docker
 ```
 
-If you have a trusted prebuilt Lean base image, `uv run setup_data.py
---base-image IMAGE_REFERENCE` pulls it instead of building that base locally.
-The later Chalk image build still installs Chalk and the task. The base image is
-separate from the model and does not contain model weights.
+The Lean base image is separate from the model and does not contain model weights.
 
 For an example using a small model on a GPU machine, see [Running a small model
 on a GPU machine](../running/small-model-vm.md). Chalk runs and scores the task;

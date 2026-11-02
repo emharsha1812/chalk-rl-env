@@ -21,7 +21,8 @@ with permission to run Docker is suitable; some hosted notebook containers canno
 run their own Docker service. For example, see [Jarvislabs VM documentation](https://docs.jarvislabs.ai/vm/).
 
 Check `nvidia-smi` and `docker info` on the machine first. The Lean base image
-is about 10 GB and builds can take an hour or longer. The model, its server,
+downloads about 2.8 GiB without cached layers and is about 9.8 GB in Docker.
+Building that base from source can take an hour or longer. The model, its server,
 the final Chalk image, and build files need additional disk and memory. GPU
 memory needs depend on the model, server version, and context length. We have
 not measured a minimum VM size for the full setup.
@@ -41,12 +42,13 @@ uv tool install .
 chalk create-env my_lean_env --template lean-math
 cd my_lean_env
 uv sync --extra dev
-uv run setup_data.py
+uv run setup_data.py --base-image \
+  ghcr.io/emharsha1812/chalk-rl-env-lean-base@sha256:a5dcd7d4dab35e7616dba28e377b00216f45877b149fdab1005a9df70067d177
 ```
 
-The last command downloads the task files and builds the Lean base image. The
-generated `LEAN_MATH.md` explains the alternative for a trusted prebuilt image
-and how to test the task without a model.
+The last command downloads the task files and the public Lean base image. The
+generated `LEAN_MATH.md` explains how to build that base from source and how to
+test the task without a model. Chalk still builds a task-specific layer on top.
 
 ## Start a model server
 

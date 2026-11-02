@@ -14,13 +14,20 @@ directory:
 
 ```sh
 uv sync --extra dev
-uv run setup_data.py
+uv run setup_data.py --base-image \
+  ghcr.io/emharsha1812/chalk-rl-env-lean-base@sha256:a5dcd7d4dab35e7616dba28e377b00216f45877b149fdab1005a9df70067d177
 uv run chalk run --task finite-congruence-graph --model MODEL_NAME --runtime docker
 ```
 
 Set the API key required by your model before the last command. `setup_data.py`
-downloads pinned task files, checks their hashes, and builds a Lean image based
-on the upstream setup if it does not already exist. The image build retries
+downloads pinned task files, checks their hashes, and pulls the public Lean base
+image. The image reference above is pinned to a specific digest. Chalk then
+builds a task-specific layer on top. Without cached layers, the base downloads
+about 2.8 GiB; Docker reports its size as about 9.8 GB. It does not contain
+model weights. To build the base from source instead, use `uv run setup_data.py`
+without `--base-image`; it reuses a local base image when one already exists.
+
+The source image build retries
 interrupted maths library downloads and keeps a build cache. It downloads the
 full library in one pass, which needs more temporary disk space than the
 upstream build. It also saves the local image without compression to reduce
@@ -32,8 +39,7 @@ configuration asks for 4 CPUs, 8 GB of memory, and 10 GB of working disk.
 These are upstream settings, not a guarantee that the task fits every computer.
 Run `uv run setup_data.py --data-only` to fetch files without building the image.
 
-If you have a trusted prebuilt copy of the Lean base image, you can download it
-instead of building that base locally:
+To pull a different trusted Lean base image, use:
 
 ```sh
 uv run setup_data.py --base-image IMAGE_REFERENCE
