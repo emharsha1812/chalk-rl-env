@@ -1,0 +1,42 @@
+name: Lean task checks
+on:
+  push:
+    paths:
+      - src/chalk/templates/lean-math/**
+      - src/chalk/agents/builtin_source.py
+      - src/chalk/cli/run.py
+      - src/chalk/schemas/**
+      - tests/test_lean_math_template.py
+      - tests/test_reasoning_replay.py
+      - tests/test_run.py
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/lean-math-checks.yaml
+  pull_request:
+    paths:
+      - src/chalk/templates/lean-math/**
+      - src/chalk/agents/builtin_source.py
+      - src/chalk/cli/run.py
+      - src/chalk/schemas/**
+      - tests/test_lean_math_template.py
+      - tests/test_reasoning_replay.py
+      - tests/test_run.py
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/lean-math-checks.yaml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Check the template and small-model settings
+        run: >-
+          uv run --frozen --extra test python -m pytest --numprocesses=0
+          tests/test_lean_math_template.py
+          tests/test_run.py::TestConfigFromFlags
+          tests/test_reasoning_replay.py::test_self_hosted_model_receives_the_requested_output_limit
