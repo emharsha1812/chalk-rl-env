@@ -20,4 +20,5 @@ RUN apt-get update -qq \
 {% endblock %}
 {% block extra_build_steps %}
 COPY third_party/openai_math/ /usr/share/licenses/chalk-openai-math/
+COPY third_party_licenses/ /usr/share/licenses/chalk-lean-tools/
 {% endblock %}

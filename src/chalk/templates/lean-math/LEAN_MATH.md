@@ -97,3 +97,5 @@ The task, checker and image setup come from FineEnvs/openai-math. The Lean
 statement comes from OpenAI's openai/math. Their Apache 2.0 licenses and notice
 are downloaded to `third_party/openai_math/` by `setup_data.py`. The source is
 fixed to dataset revision `d7056fd31c19fd1a0aed0a0bc3e99026d412b2ca`.
+Licenses for the Comparator, lean4export, and landrun binaries are in
+`third_party_licenses/` and are copied into the built image.

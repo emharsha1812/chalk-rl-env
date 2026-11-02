@@ -24,9 +24,11 @@ def test_lean_template_renders_an_ubuntu_image_and_task(tmp_path: Path):
     )
     assert "dnf install" not in commands
     assert "chalk check" in dockerfile
+    assert "COPY third_party_licenses/" in dockerfile
     assert (target / "src/environment/tasks/finite_congruence_graph/judge.py").is_file()
     assert (target / "setup_data.py").is_file()
     assert (target / "LEAN_MATH.md").is_file()
+    assert (target / "third_party_licenses/landrun-MIT.txt").is_file()
 
 
 def test_default_template_still_uses_its_original_base(tmp_path: Path):
