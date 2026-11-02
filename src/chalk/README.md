@@ -13,9 +13,12 @@ FineEnvs/openai-math. This release does not add a training system.
 ## Install locally
 
 Install [Python 3.12+](https://www.python.org/) and [uv](https://docs.astral.sh/uv/).
-Use Linux or macOS; on Windows, run the commands in WSL. From this project directory, run:
+Use Linux or macOS; on Windows, run the commands in WSL. Clone this repository
+and install Chalk from the checkout:
 
 ```sh
+git clone https://github.com/emharsha1812/chalk-rl-env.git
+cd chalk-rl-env
 uv tool install .
 chalk --version
 chalk --help

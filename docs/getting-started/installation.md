@@ -10,9 +10,11 @@
 
 ## Install Chalk locally
 
-From the project checkout:
+Clone the public repository and install from the checkout:
 
 ```sh
+git clone https://github.com/emharsha1812/chalk-rl-env.git
+cd chalk-rl-env
 uv tool install .
 chalk --version
 chalk --help
