@@ -15,6 +15,8 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Keep registry credentials in the temporary runner directory
+        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/chalk-docker-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
       - name: Make room on the temporary GitHub runner
         if: ${{ !inputs.use_local_base }}
         run: |
@@ -44,3 +46,6 @@ jobs:
         run: |
           docker push "$CHALK_RELEASE_IMAGE"
           docker image inspect "$CHALK_RELEASE_IMAGE" --format '{{index .RepoDigests 0}}'
+      - name: Remove registry credentials
+        if: ${{ always() }}
+        run: docker logout ghcr.io || true
